@@ -1,0 +1,5 @@
+[Unit]
+Description=Reap orphaned Convex local executors
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/reap-convex-executors

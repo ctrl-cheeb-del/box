@@ -1,0 +1,4 @@
+*.log
+*.rdp
+*.bak*
+.DS_Store

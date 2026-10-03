@@ -1,0 +1,77 @@
+#!/bin/bash
+# Stop `bun dev` stacks nobody has touched in IDLE_HOURS, and kill stack processes whose
+# orchestrator is gone. A stack holds 3-5 GB; the box never reboots, so forgotten ones pile up
+# until it swaps itself unresponsive (2026-10-02: 7 stacks, load 39, T3 unreachable).
+# Usage: reap-idle-dev-stacks [--dry-run]
+set -u
+IDLE_HOURS=${IDLE_HOURS:-8}
+ORPHAN_MIN_AGE=${ORPHAN_MIN_AGE:-1800}
+DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
+now=$(date +%s)
+cutoff=$((now - IDLE_HOURS * 3600))
+
+run() { if [ $DRY = 1 ]; then echo "  (dry-run) $*"; else "$@"; fi; }
+
+# Newest sign that a person or agent worked in $1: edited files, git activity, or a Claude
+# transcript for that directory. The stack's own output (.dev, .next, .convex...) doesn't count.
+last_activity() {
+  local wt=$1 newest=0 t gitdir slug
+  t=$(find "$wt" \( -name node_modules -o -name .next -o -name .dev -o -name .convex -o -name .git \
+        -o -name .turbo -o -name .wrangler -o -name dist -o -name .cache \) -prune \
+        -o -type f -newermt "@$cutoff" -printf '%T@\n' -quit 2>/dev/null | cut -d. -f1)
+  [ -n "$t" ] && newest=$t
+  if [ -f "$wt/.git" ]; then gitdir=$(sed -n 's/^gitdir: //p' "$wt/.git"); else gitdir="$wt/.git"; fi
+  for f in "$gitdir/index" "$gitdir/HEAD" "$gitdir/logs/HEAD"; do
+    [ -e "$f" ] && t=$(stat -c %Y "$f") && [ "$t" -gt "$newest" ] && newest=$t
+  done
+  slug=$(printf '%s' "$wt" | tr '/.' '--')
+  t=$(find "$HOME/.claude/projects/$slug" -maxdepth 1 -name '*.jsonl' -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
+  [ -n "$t" ] && [ "$t" -gt "$newest" ] && newest=$t
+  echo "$newest"
+}
+
+stop_group() { # $1 = orchestrator pid, $2 = process group
+  run kill -TERM "$1" 2>/dev/null
+  [ $DRY = 1 ] && return
+  for _ in $(seq 30); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
+  pkill -TERM -g "$2" 2>/dev/null; sleep 3; pkill -KILL -g "$2" 2>/dev/null
+}
+
+# 1. Idle stacks: one dev.pid per `.dev/<profile>/` that points at a live scripts/dev.ts.
+for pidfile in "$HOME"/.t3/worktrees/*/*/.dev/*/dev.pid "$HOME"/projects/*/.dev/*/dev.pid \
+               "$HOME"/Documents/projects/*/.claude/worktrees/*/.dev/*/dev.pid; do
+  [ -f "$pidfile" ] || continue
+  pid=$(tr -dc 0-9 < "$pidfile"); [ -n "$pid" ] || continue
+  tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -q 'scripts/dev.ts' || continue
+  wt=${pidfile%/.dev/*}
+  started=$(stat -c %Y "/proc/$pid")
+  [ "$started" -gt "$cutoff" ] && continue
+  last=$(last_activity "$wt")
+  [ "$last" -gt "$cutoff" ] && continue
+  idle_h=$(( (now - (last > started ? last : started)) / 3600 ))
+  pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+  echo "stopping idle stack $wt (pid $pid, idle ${idle_h}h)"
+  [ $DRY = 0 ] && echo "[reaper] $(date -Is) stopped: no activity in this worktree for ${idle_h}h. Run \`bun dev --worktree\` to bring it back." >> "${pidfile%/dev.pid}/dev.log"
+  stop_group "$pid" "$pgid"
+done
+
+# 2. Orphans: stack processes with no live scripts/dev.ts among their ancestors.
+has_dev_ancestor() {
+  local p=$1
+  while [ "$p" -gt 1 ] 2>/dev/null; do
+    tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline" | grep -q 'scripts/dev.ts' && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$p" ] || return 1
+  done
+  return 1
+}
+for pid in $(pgrep -f 'next-server|convex-local-backend|workerd|node_modules/.bin/(next|convex) dev'); do
+  [ -d "/proc/$pid" ] || continue
+  has_dev_ancestor "$pid" && continue
+  age=$(( now - $(stat -c %Y "/proc/$pid") )); [ "$age" -lt "$ORPHAN_MIN_AGE" ] && continue
+  # Only directories that ran a `bun dev` stack; a plain `next dev` in another repo is not ours.
+  d=$(readlink "/proc/$pid/cwd")
+  while [ "$d" != / ] && ! compgen -G "$d/.dev/*/dev.pid" >/dev/null; do d=$(dirname "$d"); done
+  [ "$d" = / ] && continue
+  echo "killing orphan $pid ($(ps -o comm= -p "$pid")) in $(readlink "/proc/$pid/cwd")"
+  run kill -TERM "$pid"
+done

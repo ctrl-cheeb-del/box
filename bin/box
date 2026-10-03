@@ -1,0 +1,233 @@
+#!/bin/zsh
+# box — drive Art's always-on agent machines from this Mac.
+# Machines are listed in ~/.config/agentbox/machines; the "default" one is used when none is named.
+# Every command tries the home network first, then Tailscale (starting it on the Mac if needed).
+
+USER_NAME="art"
+PROXY_LOCAL_PORT=24874
+CONF_DIR="$HOME/.config/agentbox"
+MACHINES_FILE="${BOX_MACHINES:-${0:A:h}/../machines}"
+TS="/usr/local/bin/tailscale"
+MAC_MEMORY="$HOME/.claude/projects/-Users-art-Documents-projects-revnu2/memory/"
+BOX_MEMORY=".claude/projects/-home-art-Documents-projects-revnu2/memory/"
+
+typeset -A M_LAN M_TS M_ROLES
+M_NAMES=()
+while read -r name lan ts roles _; do
+  [[ -z $name || $name == \#* ]] && continue
+  M_NAMES+=($name); M_LAN[$name]=$lan; M_TS[$name]=$ts; M_ROLES[$name]=$roles
+done < "$MACHINES_FILE"
+
+has_role() { [[ ",${M_ROLES[$1]}," == *",$2,"* ]]; }
+machine_with_role() { local n; for n in $M_NAMES; do has_role $n $1 && { echo $n; return; }; done; }
+is_machine() { (( ${M_NAMES[(Ie)$1]} )); }
+
+TARGET=""
+say() { print -P "%F{cyan}${TARGET:-box}%f $*" >&2; }
+
+reachable() { nc -z -G "${3:-2}" "$1" "$2" >/dev/null 2>&1; }
+
+# Prints the address to use for $TARGET; starts Tailscale when the home network fails.
+resolve() {
+  local port=${1:-22} lan=${M_LAN[$TARGET]} ts=${M_TS[$TARGET]}
+  if reachable "$lan" "$port"; then echo "$lan"; return; fi
+  [[ -z $ts || $ts == - ]] && { say "can't reach $lan. Is it on?"; return 1; }
+  if reachable "$ts" "$port"; then say "via Tailscale"; echo "$ts"; return; fi
+  say "not on home network, starting Tailscale..."
+  pgrep -xq Tailscale || open -ga Tailscale
+  sleep 2
+  "$TS" up >/dev/null 2>&1
+  for _ in {1..15}; do
+    if reachable "$ts" "$port"; then say "via Tailscale"; echo "$ts"; return; fi
+    sleep 1
+  done
+  say "can't reach $TARGET (home network or Tailscale). Is it on?"
+  return 1
+}
+
+run() { local h; h=$(resolve) || return 1; ssh -o BatchMode=yes "$USER_NAME@$h" "$@"; }
+
+need_role() {
+  has_role $TARGET $1 && return
+  say "$2 $(machine_with_role $1): use \`box $3\`"
+  return 1
+}
+
+cmd_list() {
+  local n where
+  printf "%-10s %-16s %-17s %-16s %s\n" MACHINE LAN TAILSCALE ROLES NOW
+  for n in $M_NAMES; do
+    if reachable "${M_LAN[$n]}" 22 1; then where="home network"
+    elif [[ ${M_TS[$n]} != - ]] && reachable "${M_TS[$n]}" 22 1; then where="via Tailscale"
+    else where="unreachable"; fi
+    printf "%-10s %-16s %-17s %-16s %s\n" $n ${M_LAN[$n]} ${M_TS[$n]} ${M_ROLES[$n]} "$where"
+  done
+}
+
+cmd_ssh() {
+  local h; h=$(resolve) || return 1
+  # tmux keeps the shell alive if the connection drops; reattach with `box` again.
+  ssh -t "$USER_NAME@$h" 'tmux new -A -s main'
+}
+
+# FreeRDP by default: the Windows App dropped every session after ~1 min against GNOME's RDP
+# server (0x200d), FreeRDP held. Password comes from the Keychain item "agentbox-rdp".
+cmd_desktop() {
+  [[ $1 == --windows-app ]] && { cmd_desktop_windows_app; return; }
+  local h pw; h=$(resolve 3389) || return 1
+  pw=$(security find-generic-password -a "$USER_NAME" -s agentbox-rdp -w 2>/dev/null) || {
+    say "no password in Keychain; add it with: security add-generic-password -a art -s agentbox-rdp -w"
+    return 1
+  }
+  nohup /opt/homebrew/bin/sdl-freerdp "/v:$h" "/u:$USER_NAME" "/p:$pw" /cert:ignore \
+    /dynamic-resolution /size:1600x1000 +clipboard /audio-mode:2 \
+    +auto-reconnect /auto-reconnect-max-retries:50 /log-level:ERROR \
+    >"$CONF_DIR/freerdp-$TARGET.log" 2>&1 &!
+  say "opening desktop (FreeRDP); log: $CONF_DIR/freerdp-$TARGET.log"
+}
+
+cmd_desktop_windows_app() {
+  local h; h=$(resolve 3389) || return 1
+  local rdp="$CONF_DIR/$TARGET.rdp"
+  cat > "$rdp" <<EOF
+full address:s:$h
+username:s:$USER_NAME
+prompt for credentials on client:i:0
+screen mode id:i:2
+dynamic resolution:i:1
+session bpp:i:16
+use multimon:i:0
+use redirection server name:i:1
+audiomode:i:2
+EOF
+  open -a "Windows App" "$rdp"
+}
+
+cmd_proxy() {
+  need_role proxy "the Claude proxy lives on" proxy || return 1
+  local h; h=$(resolve) || return 1
+  if ! reachable localhost "$PROXY_LOCAL_PORT"; then
+    ssh -f -N -o ExitOnForwardFailure=yes -L "${PROXY_LOCAL_PORT}:localhost:24873" "$USER_NAME@$h" || return 1
+  fi
+  ssh -o BatchMode=yes "$USER_NAME@$h" 'cat ~/.cli-proxy-api/management-key' | tr -d '\n' | pbcopy
+  say "management key copied to clipboard"
+  open "http://localhost:$PROXY_LOCAL_PORT/management.html"
+}
+
+cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LOCAL_PORT" && say "proxy tunnel closed"; }
+
+cmd_status() {
+  local h; h=$(resolve) || return 1
+  [[ $h == "${M_LAN[$TARGET]}" ]] && say "reachable on home network" || say "reachable via Tailscale"
+  ssh -T -o BatchMode=yes "$USER_NAME@$h" 'bash -s' <<'EOF'
+ok() { [ "$1" = active ] && printf "\e[32m%s\e[0m" "$1" || printf "\e[31m%s\e[0m" "$1"; }
+echo "uptime      $(uptime -p)"
+echo "t3 code     $(ok $(systemctl --user is-active t3code))"
+if [ -f ~/.cli-proxy-api/management-key ]; then
+  echo "cliproxy    $(ok $(systemctl --user is-active cliproxyapi))"
+  key=$(cat ~/.cli-proxy-api/management-key)
+  echo "claude accts $(curl -s -H "Authorization: Bearer $key" http://127.0.0.1:24873/v0/management/auth-files | jq -r '[.files[] | "\(.email) (\(.status))"] | join(", ")')"
+else
+  base=$(jq -r ".env.ANTHROPIC_BASE_URL // empty" ~/.claude/settings.json 2>/dev/null)
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$base/v1/models" -H "x-api-key: $(cat ~/.cli-proxy-api/proxy-key 2>/dev/null)")
+  [ "$code" = 200 ] && st=active || st="unreachable ($code)"
+  echo "claude via  $base $(ok "$st")"
+fi
+systemctl list-unit-files tailscaled.service >/dev/null 2>&1 && echo "tailscale   $(ok $(systemctl is-active tailscaled))"
+systemctl --user list-unit-files gnome-remote-desktop.service 2>/dev/null | grep -q enabled && echo "remote desk $(ok $(systemctl --user is-active gnome-remote-desktop))"
+[ -d /sys/class/power_supply/BAT0 ] && echo "battery     $(cat /sys/class/power_supply/BAT0/capacity)% $(cat /sys/class/power_supply/BAT0/status) (cap $(cat /sys/class/power_supply/BAT0/charge_control_end_threshold)%)"
+echo "t3 connect  $(sh -lc 't3 connect status 2>/dev/null' | grep -E 'Exposure' | sed 's/.*: //')"
+echo "memory      $(free -h | awk '/Mem/{print $3" used / "$2}')"
+echo "disk        $(df -h / | awk 'NR==2{print $3" used / "$2}')"
+EOF
+}
+
+cmd_reboot() {
+  local h; h=$(resolve) || return 1
+  say "rebooting..."
+  ssh -o BatchMode=yes "$USER_NAME@$h" 'sudo systemctl reboot' 2>/dev/null
+  sleep 20
+  for _ in {1..40}; do reachable "$h" 22 && break; sleep 3; done
+  sleep 15
+  cmd_status
+}
+
+cmd_logs() {
+  local unit=${1:-t3code} h; h=$(resolve) || return 1
+  ssh -t "$USER_NAME@$h" "journalctl --user -u $unit -n 100 -f"
+}
+
+cmd_claude_login() {
+  need_role proxy "Claude accounts live on" claude-login || return 1
+  local h; h=$(resolve) || return 1
+  say "sign in on the page that opens in your browser"
+  ssh -t -L 54545:localhost:54545 "$USER_NAME@$h" '~/.local/bin/cliproxyapi -config ~/.config/cliproxyapi/config.yaml -claude-login -no-browser'
+}
+
+# Two-way sync of revnu2's Claude memories with every reachable machine; the newer copy of each file wins.
+cmd_sync_memory() {
+  local n h synced=()
+  for n in $M_NAMES; do
+    TARGET=$n
+    h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
+    ssh -o BatchMode=yes "$USER_NAME@$h" "mkdir -p ~/$BOX_MEMORY" || continue
+    rsync -au "$MAC_MEMORY" "$USER_NAME@$h:$BOX_MEMORY" && rsync -au "$USER_NAME@$h:$BOX_MEMORY" "$MAC_MEMORY" && synced+=($n)
+  done
+  # Second pass so a newer file pulled from a later machine reaches the earlier ones too.
+  for n in $synced; do TARGET=$n; h=$(resolve 2>/dev/null) && rsync -au "$MAC_MEMORY" "$USER_NAME@$h:$BOX_MEMORY"; done
+  TARGET=""
+  say "memories synced with ${(j:, :)synced:-nothing} ($(ls "$MAC_MEMORY" | grep -vc MEMORY.md) files)"
+}
+
+cmd_update() {
+  local h; h=$(resolve) || return 1
+  ssh -t "$USER_NAME@$h" 'sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade" && systemctl --user restart t3code'
+}
+
+cmd_help() {
+  cat <<EOF
+box [machine]                 shell on a machine (tmux session "main", survives disconnects)
+box list                      the registered machines and whether they're reachable now
+box desktop [machine]         open its Ubuntu desktop (FreeRDP; --windows-app for the old client)
+box status [machine|all]      health check: services, Claude, battery, T3 Connect, disk
+box run [machine] <cmd>       run one command
+box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
+box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun
+box reboot [machine]          reboot and wait until it's back, then show status
+box sync-memory               two-way sync of revnu2 Claude memories with every machine (newer file wins)
+box proxy                     CLIProxyAPI dashboard (key copied to clipboard)
+box proxy-close               close the dashboard tunnel
+box claude-login              add or re-auth a Claude account in the proxy
+
+Machines: ${(j:, :)M_NAMES}. Default: $(machine_with_role default). Register one in $MACHINES_FILE.
+EOF
+}
+
+# `box jarvis status` and `box status jarvis` both work; with no machine named, the default is used.
+args=("$@")
+if is_machine "${args[1]}"; then TARGET=${args[1]}; args=("${args[@]:1}"); fi
+cmd=${args[1]:-ssh}; args=("${args[@]:1}")
+ALL=0
+if [[ -z $TARGET ]] && is_machine "${args[1]}"; then TARGET=${args[1]}; args=("${args[@]:1}")
+elif [[ -z $TARGET && ${args[1]} == all ]]; then ALL=1; args=("${args[@]:1}"); fi
+case $cmd in proxy|p|proxy-close|claude-login) TARGET=${TARGET:-$(machine_with_role proxy)} ;; esac
+TARGET=${TARGET:-$(machine_with_role default)}
+
+each() { if (( ALL )); then for TARGET in $M_NAMES; do "$@"; echo; done; else "$@"; fi; }
+
+case $cmd in
+  ssh|"") cmd_ssh ;;
+  list|ls|-l|-list|--list) cmd_list ;;
+  desktop|rdp|d) cmd_desktop "${args[1]}" ;;
+  proxy|p) cmd_proxy ;;
+  proxy-close) cmd_proxy_close ;;
+  status|s) each cmd_status ;;
+  run) run "${args[@]}" ;;
+  logs|l) cmd_logs "${args[1]}" ;;
+  claude-login) cmd_claude_login ;;
+  update) each cmd_update ;;
+  sync-memory) cmd_sync_memory ;;
+  reboot) cmd_reboot ;;
+  help|-h|--help) cmd_help ;;
+  *) say "unknown command: $cmd"; cmd_help; exit 1 ;;
+esac

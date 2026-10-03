@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop bun dev stacks idle for 8h and kill orphaned stack processes
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/reap-idle-dev-stacks

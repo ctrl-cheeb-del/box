@@ -1,0 +1,11 @@
+#!/bin/sh
+# Kill Convex local executors (node /tmp/.tmpX/local.cjs) whose convex-local-backend has exited.
+# The backend does not stop its executor on shutdown; an orphan can never serve anything again.
+for pid in $(pgrep -x node); do
+  dir=$(tr "\0" "\n" < /proc/$pid/cmdline 2>/dev/null | sed -n "2s#^\(/tmp/\.tmp[A-Za-z0-9]*\)/local\.cjs\$#\1#p")
+  [ -n "$dir" ] || continue
+  ppid=$(ps -o ppid= -p "$pid" | tr -d " ")
+  case "$(ps -o comm= -p "$ppid")" in convex-local-ba*) continue ;; esac
+  kill "$pid" 2>/dev/null && echo "reaped executor $pid $dir"
+  [ -O "$dir" ] && rm -rf "$dir"
+done
