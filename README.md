@@ -13,6 +13,7 @@ box logs [machine] [unit]     follow a user unit's journal (default t3code)
 box update [machine|all]      apt + t3/claude/codex/bun updates
 box reboot [machine]          reboot, wait, show status
 box sync-memory               two-way sync of revnu2 Claude memories with every machine
+box usage                     5-hour and weekly use per Claude account, and when each resets
 box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on the proxy machine)
 ```
 
@@ -26,6 +27,8 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `docs/add-a-device.md` | adding a laptop, phone or another box to this setup (copy-paste prompt inside) |
 | `docs/machines.md` | the running record: what's on each machine, where credentials live, past incidents |
 | `reapers/` | systemd user timers that stop forgotten dev stacks and orphaned Convex executors |
+| `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
+| `mac/` | launchd job: `box sync-memory` every 6 hours (never starts Tailscale) |
 
 Paths only, never secret values. Machine-local state (FreeRDP logs, `.rdp` files) stays in
 `~/.config/agentbox/`.
@@ -38,3 +41,24 @@ ln -sf ~/Documents/projects/box/bin/box ~/.local/bin/box
 brew install freerdp
 ```
 Then the SSH, Keychain and Tailscale steps in `docs/add-a-device.md`.
+
+## Heartbeat and alerts
+
+Each box runs `box-heartbeat` every 30 minutes (`heartbeat/`): a quiet "alive" push with uptime,
+memory, disk, load and Claude/T3 status, plus an urgent push when a peer box has sent nothing for 75
+minutes, memory or disk passes 90%, Claude can't reach the proxy, or T3 is down, and another when it
+clears. Messages go to an ntfy.sh topic; the topic name is the only secret, so it lives in
+`~/.config/box/ntfy-topic` on each box (and `~/.config/agentbox/ntfy-topic` on the Mac), never here.
+Subscribe to it in the ntfy phone app. A power cut takes both boxes down at once, so nobody is left to
+alert: silence in the ntfy app is the signal then.
+
+Install on a box: copy `heartbeat/box-heartbeat` to `~/.local/bin/`, the unit and timer to
+`~/.config/systemd/user/`, write the topic and a `~/.config/box/peers` file (the other boxes'
+hostnames, one per line), then `systemctl --user enable --now box-heartbeat.timer`.
+
+## Memory sync
+
+`mac/com.box.sync-memory.plist` runs `box sync-memory` every 6 hours. Copy it to
+`~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u) <that file>`. Background jobs can't read
+`~/Documents`, so `box` keeps a copy of itself and `machines` in `~/.local/share/box`, refreshed each
+time you run it; the job runs that copy. Log: `/tmp/box-sync-memory.log`.

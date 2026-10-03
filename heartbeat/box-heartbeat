@@ -1,0 +1,52 @@
+#!/bin/bash
+# Every 30 min (box-heartbeat.timer): post a quiet "alive" message to the ntfy topic, then
+# check the other boxes' heartbeats and this box's own health. Problems go out as urgent
+# pushes, once when they start and once when they clear.
+# Config, never committed: ~/.config/box/ntfy-topic (the topic name is the only secret)
+# and ~/.config/box/peers (one box hostname per line).
+set -u
+CONF=~/.config/box
+TOPIC=$(cat "$CONF/ntfy-topic") || exit 1
+URL="https://ntfy.sh/$TOPIC"
+ME=$(hostname)
+STALE_MIN=${STALE_MIN:-75}
+STATE="$CONF/alerts"; touch "$STATE"
+
+push() { curl -s -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "$URL"; }
+
+mem=$(free | awk '/Mem/{printf "%d", $3*100/$2}')
+disk=$(df / | awk 'NR==2{print $5+0}')
+load=$(cut -d" " -f1 /proc/loadavg)
+up=$(uptime -p | sed 's/^up //')
+claude=ok
+if [ -f ~/.cli-proxy-api/management-key ]; then
+  systemctl --user is-active -q cliproxyapi || claude="proxy down"
+else
+  base=$(jq -r '.env.ANTHROPIC_BASE_URL // empty' ~/.claude/settings.json 2>/dev/null)
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$base/v1/models" -H "x-api-key: $(cat ~/.cli-proxy-api/proxy-key 2>/dev/null)")
+  [ "$code" = 200 ] || claude="can't reach proxy ($code)"
+fi
+t3=$(systemctl --user is-active t3code)
+
+push "$ME" min "white_check_mark" "alive · up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3"
+
+# Problems: key=description. Each fires once, and "cleared" once it's gone.
+declare -A now
+[ "$mem" -ge 90 ] && now[mem]="memory at $mem%"
+[ "$disk" -ge 90 ] && now[disk]="disk at $disk%"
+[ "$claude" != ok ] && now[claude]="Claude: $claude"
+[ "$t3" != active ] && now[t3]="T3 Code is $t3"
+seen=$(curl -s --max-time 15 "$URL/json?poll=1&since=${STALE_MIN}m" | jq -r '.title // empty' | sort -u)
+while read -r peer; do
+  [ -z "$peer" ] && continue
+  grep -qx "$peer" <<<"$seen" || now["peer-$peer"]="$peer: no heartbeat for ${STALE_MIN}+ min (off, offline or crashed?)"
+done < "$CONF/peers"
+
+for k in "${!now[@]}"; do
+  grep -qx "$k" "$STATE" || push "$ME: problem" urgent "rotating_light" "${now[$k]}"
+done
+while read -r k; do
+  [ -z "$k" ] && continue
+  [ -n "${now[$k]+x}" ] || push "$ME: cleared" default "white_check_mark" "${k#peer-} is fine again"
+done < "$STATE"
+printf '%s\n' "${!now[@]}" | grep -v '^$' > "$STATE" || true

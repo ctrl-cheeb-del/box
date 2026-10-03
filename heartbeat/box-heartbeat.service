@@ -1,0 +1,6 @@
+[Unit]
+Description=Post a heartbeat to ntfy and alert on peer or health problems
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/box-heartbeat

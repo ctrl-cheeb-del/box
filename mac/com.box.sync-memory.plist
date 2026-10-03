@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Every 6 hours: `box sync-memory`. BOX_NO_TS_START keeps it from switching Tailscale on;
+     away from home it syncs only what's reachable. Install: see README. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.box.sync-memory</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/zsh</string><string>-c</string><string>BOX_MACHINES=$HOME/.local/share/box/machines $HOME/.local/share/box/box sync-memory</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>BOX_NO_TS_START</key><string>1</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/box-sync-memory.log</string>
+  <key>StandardErrorPath</key><string>/tmp/box-sync-memory.log</string>
+</dict>
+</plist>

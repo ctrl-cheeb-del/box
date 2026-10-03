@@ -7,6 +7,13 @@ USER_NAME="art"
 PROXY_LOCAL_PORT=24874
 CONF_DIR="$HOME/.config/agentbox"
 MACHINES_FILE="${BOX_MACHINES:-${0:A:h}/../machines}"
+# Background jobs (launchd) can't read ~/Documents, so keep a runnable copy outside it.
+SHADOW="$HOME/.local/share/box"
+if [[ ${0:A} == */bin/box && -r ${0:A:h}/../machines ]]; then
+  mkdir -p "$SHADOW"
+  cmp -s "${0:A}" "$SHADOW/box" || cp "${0:A}" "$SHADOW/box"
+  cmp -s "${0:A:h}/../machines" "$SHADOW/machines" || cp "${0:A:h}/../machines" "$SHADOW/machines"
+fi
 TS="/usr/local/bin/tailscale"
 MAC_MEMORY="$HOME/.claude/projects/-Users-art-Documents-projects-revnu2/memory/"
 BOX_MEMORY=".claude/projects/-home-art-Documents-projects-revnu2/memory/"
@@ -33,6 +40,7 @@ resolve() {
   if reachable "$lan" "$port"; then echo "$lan"; return; fi
   [[ -z $ts || $ts == - ]] && { say "can't reach $lan. Is it on?"; return 1; }
   if reachable "$ts" "$port"; then say "via Tailscale"; echo "$ts"; return; fi
+  [[ -n ${BOX_NO_TS_START:-} ]] && { say "not reachable without starting Tailscale, skipped"; return 1; }
   say "not on home network, starting Tailscale..."
   pgrep -xq Tailscale || open -ga Tailscale
   sleep 2
@@ -112,6 +120,28 @@ cmd_proxy() {
   ssh -o BatchMode=yes "$USER_NAME@$h" 'cat ~/.cli-proxy-api/management-key' | tr -d '\n' | pbcopy
   say "management key copied to clipboard"
   open "http://localhost:$PROXY_LOCAL_PORT/management.html"
+}
+
+# 5-hour and weekly use per Claude account, from the rate-limit headers the proxy last saw.
+cmd_usage() {
+  need_role proxy "Claude accounts live on" usage || return 1
+  local h; h=$(resolve) || return 1
+  ssh -T -o BatchMode=yes "$USER_NAME@$h" 'bash -s' <<'EOF'
+K=$(cat ~/.cli-proxy-api/management-key)
+curl -s -H "Authorization: Bearer $K" http://127.0.0.1:24873/v0/management/auth-files | jq -r '
+  def when: (tonumber - now) as $s | if $s <= 0 then "now" elif $s < 86400 then "in \(($s/3600)|floor)h\((($s%3600)/60)|floor)m" else "in \(($s/86400)|floor)d\((($s%86400)/3600)|floor)h" end;
+  def pct: ((tonumber * 100) | round | tostring) + "%";
+  ["ACCOUNT", "5H USED", "5H RESETS", "WEEK USED", "WEEK RESETS", "SEEN"],
+  (.files[] | . as $f
+   | ([.model_quotas // {} | to_entries[] | .value] | sort_by(.observed_at) | last) as $q
+   | if $q == null then [$f.email, "-", "-", "-", "-", "no traffic yet"]
+     else ($q.signals) as $s
+     | [$f.email, ($s["Anthropic-Ratelimit-Unified-5h-Utilization"] // "0" | pct), ($s["Anthropic-Ratelimit-Unified-5h-Reset"] | when),
+        ($s["Anthropic-Ratelimit-Unified-7d-Utilization"] // "0" | pct), ($s["Anthropic-Ratelimit-Unified-7d-Reset"] | when),
+        ($q.observed_at[11:16])] end)
+  | @tsv' | column -t -s $'\t'
+EOF
+  say "as last seen by the proxy; an account with no recent traffic shows its last known numbers"
 }
 
 cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LOCAL_PORT" && say "proxy tunnel closed"; }
@@ -195,6 +225,7 @@ box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-
 box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun
 box reboot [machine]          reboot and wait until it's back, then show status
 box sync-memory               two-way sync of revnu2 Claude memories with every machine (newer file wins)
+box usage                     5-hour and weekly use per Claude account, and when each resets
 box proxy                     CLIProxyAPI dashboard (key copied to clipboard)
 box proxy-close               close the dashboard tunnel
 box claude-login              add or re-auth a Claude account in the proxy
@@ -210,7 +241,7 @@ cmd=${args[1]:-ssh}; args=("${args[@]:1}")
 ALL=0
 if [[ -z $TARGET ]] && is_machine "${args[1]}"; then TARGET=${args[1]}; args=("${args[@]:1}")
 elif [[ -z $TARGET && ${args[1]} == all ]]; then ALL=1; args=("${args[@]:1}"); fi
-case $cmd in proxy|p|proxy-close|claude-login) TARGET=${TARGET:-$(machine_with_role proxy)} ;; esac
+case $cmd in proxy|p|proxy-close|claude-login|usage|u) TARGET=${TARGET:-$(machine_with_role proxy)} ;; esac
 TARGET=${TARGET:-$(machine_with_role default)}
 
 each() { if (( ALL )); then for TARGET in $M_NAMES; do "$@"; echo; done; else "$@"; fi; }
@@ -225,6 +256,7 @@ case $cmd in
   run) run "${args[@]}" ;;
   logs|l) cmd_logs "${args[1]}" ;;
   claude-login) cmd_claude_login ;;
+  usage|u) cmd_usage ;;
   update) each cmd_update ;;
   sync-memory) cmd_sync_memory ;;
   reboot) cmd_reboot ;;
