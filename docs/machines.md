@@ -267,3 +267,5 @@ Every machine keeps revnu2 at `~/Documents/projects/revnu2`, like the Mac, so Cl
 `-home-art-Documents-projects-revnu2` on both Linux boxes. skynet had a second, unused clone at `~/projects/revnu2`
 (deleted; it was clean) whose memory folder `box sync-memory` was syncing while skynet's threads wrote to the
 Documents one. Old folder kept in `~/old-memory-backup/` on skynet. Other repos on skynet stay in `~/projects`.
+- 2026-10-03: Tailscale SSH turned off on jarvis (`tailscale set --ssh=false`); it demanded a browser check,
+  so `box` couldn't reach jarvis away from home. Fixed by hopping through skynet (`ssh -J`).

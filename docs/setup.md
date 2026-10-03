@@ -314,8 +314,12 @@ T3 Connect already works from anywhere. For SSH, remote desktop and a second box
 box's Claude proxy, install Tailscale on each box, in **your own** tailnet:
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up --ssh --hostname=<host>     # prints a login link
+sudo tailscale up --hostname=<host>     # prints a login link
 ```
+Leave out `--ssh`: Tailscale's own SSH can demand a browser check before every new session, which
+breaks `box` and scripted SSH. Plain OpenSSH over the tailnet works without it
+(`sudo tailscale set --ssh=false` to undo). If a box is ever unreachable over Tailscale, hop through
+another box at home: `ssh -J art@<other box Tailscale IP> art@<box>.local`.
 In the admin console, **disable key expiry** for the box, or it drops off after 180 days. Your laptop
 only needs Tailscale switched on when you're away. Never port-forward SSH or RDP on the router. To offer
 the box as an exit node, enable forwarding (`net.ipv4.ip_forward = 1` and
