@@ -1,18 +1,19 @@
 #!/bin/bash
-# Every 30 min (box-heartbeat.timer): post a quiet "alive" message to the ntfy topic, then
-# check the other boxes' heartbeats and this box's own health. Problems go out as urgent
-# pushes, once when they start and once when they clear.
+# Every 30 min (box-heartbeat.timer): post an "alive" message to <topic>-hb (which no phone
+# subscribes to), then check the other boxes' heartbeats there and this box's own health.
+# Problems go to <topic> itself, once when they start and once when they clear.
 # Config, never committed: ~/.config/box/ntfy-topic (the topic name is the only secret)
 # and ~/.config/box/peers (one box hostname per line).
 set -u
 CONF=~/.config/box
 TOPIC=$(cat "$CONF/ntfy-topic") || exit 1
 URL="https://ntfy.sh/$TOPIC"
+HB_URL="$URL-hb"
 ME=$(hostname)
 STALE_MIN=${STALE_MIN:-75}
 STATE="$CONF/alerts"; touch "$STATE"
 
-push() { curl -s -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "$URL"; }
+push() { curl -s -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "${5:-$URL}"; }
 
 mem=$(free | awk '/Mem/{printf "%d", $3*100/$2}')
 disk=$(df / | awk 'NR==2{print $5+0}')
@@ -28,7 +29,7 @@ else
 fi
 t3=$(systemctl --user is-active t3code)
 
-push "$ME" min "white_check_mark" "alive · up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3"
+push "$ME" min "white_check_mark" "alive · up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3" "$HB_URL"
 
 # Problems: key=description. Each fires once, and "cleared" once it's gone.
 declare -A now
@@ -36,7 +37,7 @@ declare -A now
 [ "$disk" -ge 90 ] && now[disk]="disk at $disk%"
 [ "$claude" != ok ] && now[claude]="Claude: $claude"
 [ "$t3" != active ] && now[t3]="T3 Code is $t3"
-seen=$(curl -s --max-time 15 "$URL/json?poll=1&since=${STALE_MIN}m" | jq -r '.title // empty' | sort -u)
+seen=$(curl -s --max-time 15 "$HB_URL/json?poll=1&since=${STALE_MIN}m" | jq -r '.title // empty' | sort -u)
 while read -r peer; do
   [ -z "$peer" ] && continue
   grep -qx "$peer" <<<"$seen" || now["peer-$peer"]="$peer: no heartbeat for ${STALE_MIN}+ min (off, offline or crashed?)"
