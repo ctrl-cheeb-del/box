@@ -43,6 +43,7 @@ box claude-login    add or re-auth a Claude account in the proxy
 box update          apt upgrade + t3/claude/codex/bun updates
 box sync-memory     two-way sync of revnu2 Claude memories (newer file wins)
 box reboot          reboot, wait, show status
+box hermes          Hermes Agent dashboard, tunnelled to http://localhost:9119
 ```
 
 Each tries the home network first and starts Tailscale on the Mac if that fails.
@@ -270,3 +271,19 @@ Documents one. Old folder kept in `~/old-memory-backup/` on skynet. Other repos 
 - 2026-10-03: Tailscale SSH turned off on jarvis (`tailscale set --ssh=false`); it demanded a browser check,
   so `box` couldn't reach jarvis away from home. Fixed by hopping through skynet (`ssh -J`).
 - 2026-10-03: heartbeat (ntfy, 30 min) on skynet + jarvis, `box usage`, 6-hourly memory sync on the Mac.
+
+## Hermes Agent (2026-10-04)
+
+Nous Research's personal agent, installed to look around in. **No tasks, cron jobs or messaging set up.**
+
+- Installed with the official script (`--non-interactive --skip-computer-use`): code in `~/.hermes/hermes-agent`,
+  data and config in `~/.hermes/` (`config.yaml`, `.env`, `memories/`, `sessions/`). Backup of the stock config:
+  `~/.hermes/config.yaml.bak-install`. Update with `hermes update`.
+- Model: `providers.claude-proxy` in `config.yaml` points at this box's CLIProxyAPI (`http://127.0.0.1:24873`,
+  `transport: anthropic_messages`), key minted by `key_cmd: ~/.cli-proxy-api/api-key-helper.sh` so no key is copied.
+  Primary `claude-sonnet-5-5`, fallback `claude-haiku-4-5-20251001`. It shares the Claude accounts' limits with the
+  coding agents: when they're spent it drops to Haiku.
+- Dashboard: `hermes-dashboard.service` (systemd user unit) on `127.0.0.1:9119` only. A non-loopback bind needs an
+  auth provider (password/OAuth), so reach it with `box hermes` (SSH tunnel), never by binding 0.0.0.0.
+- Messaging isn't configured. Telegram/WhatsApp/Slack/Discord/Signal via `hermes gateway setup`; iMessage via
+  BlueBubbles (needs an always-on Mac) or Photon (`hermes photon setup --phone ...`, no Mac).

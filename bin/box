@@ -5,6 +5,7 @@
 
 USER_NAME="art"
 PROXY_LOCAL_PORT=24874
+HERMES_LOCAL_PORT=9119
 CONF_DIR="$HOME/.config/agentbox"
 MACHINES_FILE="${BOX_MACHINES:-${0:A:h}/../machines}"
 # Background jobs (launchd) can't read ~/Documents, so keep a runnable copy outside it.
@@ -146,6 +147,15 @@ EOF
 
 cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LOCAL_PORT" && say "proxy tunnel closed"; }
 
+# The Hermes dashboard binds loopback only on the box (a public bind needs an auth provider), so tunnel it.
+cmd_hermes() {
+  local h; h=$(resolve) || return 1
+  if ! reachable localhost "$HERMES_LOCAL_PORT"; then
+    ssh -f -N -o ExitOnForwardFailure=yes -L "${HERMES_LOCAL_PORT}:localhost:9119" "$USER_NAME@$h" || return 1
+  fi
+  open "http://localhost:$HERMES_LOCAL_PORT"
+}
+
 cmd_status() {
   local h; h=$(resolve) || return 1
   [[ $h == "${M_LAN[$TARGET]}" ]] && say "reachable on home network" || say "reachable via Tailscale"
@@ -229,6 +239,7 @@ box usage                     5-hour and weekly use per Claude account, and when
 box proxy                     CLIProxyAPI dashboard (key copied to clipboard)
 box proxy-close               close the dashboard tunnel
 box claude-login              add or re-auth a Claude account in the proxy
+box hermes [machine]          Hermes Agent dashboard (tunnelled to localhost:9119)
 
 Machines: ${(j:, :)M_NAMES}. Default: $(machine_with_role default). Register one in $MACHINES_FILE.
 EOF
@@ -256,6 +267,7 @@ case $cmd in
   run) run "${args[@]}" ;;
   logs|l) cmd_logs "${args[1]}" ;;
   claude-login) cmd_claude_login ;;
+  hermes|h) cmd_hermes ;;
   usage|u) cmd_usage ;;
   update) each cmd_update ;;
   sync-memory) cmd_sync_memory ;;
