@@ -116,6 +116,10 @@ tmux, Chrome. PATH for login shells is set in `~/.profile` (T3 Code needs `sh -l
   blank password (set 2026-09-25; `~/.local/share/keyrings/login.keyring` starts with `[keyring]`
   in plain text when it does). It reports `Locked b true` right after boot and unlocks on first access,
   which is normal. Check creds with `grdctl status --show-credentials` (flag goes after `status`).
+- **Proxy dashboard: "accepts v0 Management API but does not provide v8"**: the panel auto-updates from
+  GitHub and outran the binary. Upgrade the binary: Mac `brew upgrade cliproxyapi && brew services restart
+  cliproxyapi`; box: drop the `linux_amd64` release's `cli-proxy-api` into `~/.local/bin/cliproxyapi` and
+  `systemctl --user restart cliproxyapi`. Upgraded to v8 on 2026-10-07 (box backup `cliproxyapi.bak-7.3.17`).
 - **CLI logins over SSH** (convex, vercel, codex, doppler, gh): all support a device-code flow. Run with
   `--no-open`/device mode and open the printed URL in any browser, including the Mac's.
 - **Balena Etcher fails on macOS** ("requestMetadata is not a function"): flash with
