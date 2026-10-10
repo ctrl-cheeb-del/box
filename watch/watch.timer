@@ -1,0 +1,9 @@
+[Unit]
+Description=Run watch every 15 min; each creator is due every 3h from when it was added
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

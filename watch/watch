@@ -1,0 +1,501 @@
+#!/usr/bin/env node
+// Babysits a short list of revnu creators (Linear REV-381). Every 3h per creator, staggered
+// from when it was added, Opus reads what happened since the last check; a problem opens a
+// T3 thread in the revnu2 project on this box, and the same problem next time is a
+// follow-up turn in that thread. Read-only: prod is read through the revnu2-readonly
+// Doppler token in a clone that has no .env.local, so nothing it runs can write.
+//
+//   watch add <creator>              resolve by name like `bun ops`, start watching
+//   watch rm <creator>
+//   watch ls                         list, with last and next check and open problems
+//   watch ok <creator> <key> [why]   "that's fine": close it and stop flagging it
+//   watch check <creator> [--since 6h] [--dry-run]   check now, whether due or not
+//   watch tick                       check everyone due (the 15-min timer runs this)
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { randomBytes, randomUUID } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+const run = promisify(execFile);
+const HOME = process.env.HOME;
+const STATE_DIR = process.env.WATCH_STATE_DIR || join(HOME, ".local/state/watch");
+const STATE = join(STATE_DIR, "state.json");
+const LOCK = join(STATE_DIR, "lock");
+const CLONE = process.env.WATCH_REVNU2 || join(HOME, ".local/share/watch/revnu2");
+const JUDGE_PROMPT = join(dirname(fileURLToPath(import.meta.url)), "judge.md");
+const T3_URL = (process.env.T3_URL || "http://127.0.0.1:3773").replace(/\/$/, "");
+const T3_BIN = process.env.T3_BIN || "t3";
+const MODEL = process.env.WATCH_MODEL || "claude-opus-5-5";
+const REPO = "revnu-app/revnu2";
+const EVERY_MS = 3 * 3600_000;
+const CONTEXT_MS = 24 * 3600_000;
+const MAX_TIMELINE_CHARS = 120_000;
+
+const fmt = (t) => new Date(t).toISOString().slice(0, 16).replace("T", " ") + "Z";
+const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+// ---------- state ----------
+
+function load() {
+  if (!existsSync(STATE)) return { creators: {}, notes: [] };
+  return JSON.parse(readFileSync(STATE, "utf8"));
+}
+
+function save(state) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(`${STATE}.tmp`, JSON.stringify(state, null, 2));
+  renameSync(`${STATE}.tmp`, STATE);
+}
+
+/** The most recent 3h slot boundary since addedAt; due when the last check predates it. */
+function lastSlot(c, now) {
+  return c.addedAt + Math.floor((now - c.addedAt) / EVERY_MS) * EVERY_MS;
+}
+const isDue = (c, now) => c.lastCheckedAt < lastSlot(c, now);
+const nextCheck = (c, now) => (isDue(c, now) ? now : lastSlot(c, now) + EVERY_MS);
+
+/** One check at a time: a slow Opus call must not overlap the next tick. */
+function withLock(fn) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  let fd;
+  try {
+    fd = openSync(LOCK, "wx");
+  } catch {
+    const pid = Number(readFileSync(LOCK, "utf8"));
+    try {
+      process.kill(pid, 0);
+      console.log(`another watch run (pid ${pid}) holds the lock`);
+      return;
+    } catch {
+      unlinkSync(LOCK);
+      fd = openSync(LOCK, "wx");
+    }
+  }
+  writeFileSync(fd, String(process.pid));
+  closeSync(fd);
+  return fn().finally(() => unlinkSync(LOCK));
+}
+
+// ---------- read-only revnu2 ----------
+
+/** A script in the clone, with only the read-only prod token in its environment. */
+async function revnu(args, { json = false } = {}) {
+  const { stdout } = await run(
+    "doppler",
+    ["run", "--project", "revnu2-readonly", "--config", "prd", "--", "bun", ...args],
+    {
+      cwd: CLONE,
+      env: { HOME, PATH: `${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin` },
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 5 * 60_000,
+    },
+  );
+  return json ? JSON.parse(stdout) : stdout;
+}
+const ops = (verb, ...rest) => revnu(["scripts/ops.ts", verb, ...rest, "--prod", "--json"], { json: true });
+
+/** Investigate with the code on main today, not whatever the clone had. */
+async function refreshClone() {
+  const lockBefore = await run("git", ["-C", CLONE, "rev-parse", "HEAD:bun.lock"]).catch(() => ({ stdout: "" }));
+  await run("git", ["-C", CLONE, "fetch", "-q", "origin", "main"]);
+  await run("git", ["-C", CLONE, "reset", "-q", "--hard", "origin/main"]);
+  const lockAfter = await run("git", ["-C", CLONE, "rev-parse", "HEAD:bun.lock"]);
+  if (lockBefore.stdout !== lockAfter.stdout || !existsSync(join(CLONE, "node_modules"))) {
+    await run(`${HOME}/.bun/bin/bun`, ["install", "--frozen-lockfile"], { cwd: CLONE, timeout: 10 * 60_000 });
+  }
+}
+
+async function resolve(query) {
+  const all = await ops("creators");
+  const q = query.toLowerCase();
+  const exact = all.filter((c) => c.id === query || c.name?.toLowerCase() === q);
+  const hits = exact.length ? exact : all.filter((c) => c.name?.toLowerCase().includes(q));
+  if (hits.length === 1) return hits[0];
+  if (!hits.length) throw new Error(`no creator matches "${query}"`);
+  throw new Error(`"${query}" is ambiguous:\n${hits.map((c) => `  ${c.name}  ${c.id}`).join("\n")}`);
+}
+
+function findWatched(state, query) {
+  const q = query.toLowerCase();
+  const hits = Object.values(state.creators).filter(
+    (c) => c.id === query || slug(c.name) === slug(query) || c.name.toLowerCase().includes(q),
+  );
+  if (hits.length !== 1) throw new Error(hits.length ? `"${query}" matches several watched creators` : `not watching "${query}"`);
+  return hits[0];
+}
+
+// ---------- gather ----------
+
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** The debrief skill's conversation rebuild: customer, agent, tools, silences, errors. */
+function timeline(bundle, windowStart) {
+  const ev = (bundle.spans ?? []).map((s) => [s.receivedAt, "CUSTOMER", `[${s.provider}] ${s.messagePreview ?? ""}${s.interrupted ? " (interrupted)" : ""}`]);
+  for (const a of bundle.activity ?? []) {
+    const p = a.payload ?? {};
+    const t = a.timestamp;
+    if (a.tag === "request") ev.push([t, "TURN", p.kind === "background_task" ? `background task: ${p.label}` : a.requestId.slice(0, 12)]);
+    else if (a.tag === "send_message") ev.push([t, "AGENT", p.input?.text ?? p.text ?? ""]);
+    else if (a.tag === "tool_call") ev.push([t, "RAN", p.argv ?? p.name]);
+    else if (a.tag === "tool_result" && String(p.name).includes("do_nothing")) ev.push([t, "SILENT", clip(String(p.input), 300)]);
+    else if (a.tag === "error" || a.tag === "turn_nudged") ev.push([t, a.tag.toUpperCase(), clip(JSON.stringify(p), 400)]);
+    else if (a.tag === "claude_result")
+      ev.push([t, "END", `${p.runtime ?? "claude"} ${p.model} cost=$${(p.totalCostUsd ?? 0).toFixed(2)} ${p.isError ? "ERROR " : ""}${p.terminalReason ?? ""}`]);
+  }
+  for (const e of bundle.errors ?? []) ev.push([e.lastSeenAt, "ERROR-LOG", `${e.name}: ${clip(e.message ?? "", 300)} (x${e.count})`]);
+  ev.sort((a, b) => a[0] - b[0]);
+  const lines = [];
+  let marked = false;
+  for (const [t, kind, text] of ev) {
+    if (!marked && t >= windowStart) {
+      lines.push(`---------- NEW SINCE LAST CHECK (${fmt(windowStart)}) ----------`);
+      marked = true;
+    }
+    lines.push(`${fmt(t)} ${kind} ${String(text).replace(/\n/g, " / ")}`);
+  }
+  if (!marked) lines.push(`---------- NEW SINCE LAST CHECK (${fmt(windowStart)}): nothing ----------`);
+  let out = lines.join("\n");
+  // Keep the newest rows: the window matters more than old context.
+  if (out.length > MAX_TIMELINE_CHARS) out = `[older rows cut]\n${out.slice(-MAX_TIMELINE_CHARS)}`;
+  return { text: out, events: ev };
+}
+
+async function gather(c, now, windowStart) {
+  const contextStart = Math.min(windowStart, now - CONTEXT_MS);
+  const since = `${Math.ceil((now - contextStart) / 60_000)}m`;
+  const file = join(tmpdir(), `watch-${c.id}.json`);
+  await revnu(["scripts/investigate.ts", "--prod", "--creator", c.id, "--since", since, "--json", "--out", file]);
+  const bundle = JSON.parse(readFileSync(file, "utf8"));
+  unlinkSync(file);
+  const [verdicts, record, reviews, workflows, email] = await Promise.all([
+    revnu(["scripts/investigate.ts", "--prod", "--creator", c.id, "--since", `${Math.ceil((now - windowStart) / 60_000)}m`]),
+    ops("creator", c.id),
+    ops("review-queue", c.id, "--limit", "20").catch((e) => `unavailable: ${e.message}`),
+    ops("workflows", c.id, "--limit", "10").catch((e) => `unavailable: ${e.message}`),
+    ops("email", c.id).catch((e) => `unavailable: ${e.message}`),
+  ]);
+  return { bundle, verdicts, record, reviews, workflows, email, timeline: timeline(bundle, windowStart) };
+}
+
+/** Skip quiet windows, unless the quiet is the problem. Returns why to judge, or null. */
+function reasonToJudge(g, now, windowStart) {
+  const ev = g.timeline.events;
+  const fresh = ev.filter(([t, kind]) => t >= windowStart && kind !== "TURN");
+  const newCards = Array.isArray(g.reviews) ? g.reviews.filter((r) => (r.createdAt ?? 0) >= windowStart).length : 0;
+  if (fresh.length || newCards) return `${fresh.length} events and ${newCards} new review cards since the last check`;
+  const lastCustomer = ev.filter(([, k]) => k === "CUSTOMER").at(-1);
+  const lastReply = ev.filter(([, k]) => k === "AGENT").at(-1);
+  if (lastCustomer && (!lastReply || lastReply[0] < lastCustomer[0]) && now - lastCustomer[0] > 20 * 60_000)
+    return `the customer's last message (${fmt(lastCustomer[0])}) has no reply`;
+  if (!ev.some(([t, k]) => t >= now - CONTEXT_MS && (k === "AGENT" || k === "RAN"))) return "nothing shipped in 24h";
+  return null;
+}
+
+// ---------- judge ----------
+
+function judgePrompt(c, g, why, openProblems, notes) {
+  const memory = [
+    g.record.businessContext ? `## About This Business\n${g.record.businessContext}` : "",
+    g.record.brandFactsMarkdown ? `## Product Facts\n${g.record.brandFactsMarkdown}` : "",
+  ].join("\n\n");
+  const json = (v) => clip(typeof v === "string" ? v : JSON.stringify(v, null, 1), 20_000);
+  return [
+    readFileSync(JUDGE_PROMPT, "utf8"),
+    `# Creator: ${c.name} (${c.id}), plan ${g.record.plan}, time zone ${g.record.timeZone}`,
+    `Checked at ${fmt(Date.now())}. Why this check runs: ${why}.`,
+    `# Their Memory\n${clip(memory, 25_000) || "(empty)"}`,
+    `# Open problems already reported (reuse the key if it's the same problem)\n${openProblems.length ? openProblems.map((p) => `- ${p.key}: ${p.summary}`).join("\n") : "(none)"}`,
+    `# Art said these are fine: do not flag them\n${notes.length ? notes.map((n) => `- ${n.key}: ${n.note}`).join("\n") : "(none)"}`,
+    `# Turn verdicts in the new window (bun investigate)\n${clip(g.verdicts, 15_000)}`,
+    `# Timeline (UTC; rows above the NEW marker are context you already reviewed)\n${g.timeline.text}`,
+    `# Review queue (pending cards)\n${json(g.reviews)}`,
+    `# Workflows and recent runs\n${json(g.workflows)}`,
+    `# Email delivery and pending queue\n${json(g.email)}`,
+  ].join("\n\n");
+}
+
+async function judge(prompt) {
+  const dir = join(tmpdir(), "watch-judge");
+  mkdirSync(dir, { recursive: true });
+  const child = execFile(
+    "claude",
+    ["-p", "--model", MODEL, "--output-format", "json", "--tools", "", "--no-session-persistence"],
+    { cwd: dir, maxBuffer: 16 * 1024 * 1024, timeout: 15 * 60_000 },
+  );
+  child.stdin.end(prompt);
+  const stdout = await new Promise((resolve, reject) => {
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`claude exited ${code}: ${err.slice(0, 500)}`))));
+  });
+  const envelope = JSON.parse(stdout);
+  if (envelope.is_error) throw new Error(`claude: ${envelope.result}`);
+  const text = String(envelope.result);
+  const body = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
+  const verdict = JSON.parse(body);
+  if (typeof verdict.ok !== "boolean" || !Array.isArray(verdict.problems)) throw new Error(`judge returned no verdict: ${clip(text, 300)}`);
+  return { ...verdict, costUsd: envelope.total_cost_usd };
+}
+
+// ---------- T3 (dispatch copied from index-ring/box/poller.mjs) ----------
+
+async function withT3Session(fn) {
+  const { stdout } = await run(T3_BIN, ["auth", "session", "issue", "--ttl", "5m", "--label", "watch", "--json"]);
+  const session = JSON.parse(stdout);
+  try {
+    return await fn(session.token);
+  } finally {
+    await run(T3_BIN, ["auth", "session", "revoke", session.sessionId]).catch((err) =>
+      console.error("revoking t3 session failed:", err.message),
+    );
+  }
+}
+
+async function t3(token, path, init = {}) {
+  return await fetch(`${T3_URL}${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, ...init.headers } });
+}
+
+function repoFromRemote(url) {
+  const match = url.trim().match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?\/?$/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+async function git(cwd, ...args) {
+  const { stdout } = await run("git", ["-C", cwd, ...args]);
+  return stdout.trim();
+}
+
+async function findProject(snapshot) {
+  for (const project of snapshot.projects ?? []) {
+    if (project.deletedAt) continue;
+    const remote = await git(project.workspaceRoot, "remote", "get-url", "origin").catch(() => "");
+    if (repoFromRemote(remote) === REPO) return project;
+  }
+  throw new Error(`no T3 project on this box has ${REPO} as its origin`);
+}
+
+async function dispatch(token, command) {
+  const ticketRes = await t3(token, "/api/auth/websocket-ticket", { method: "POST" });
+  if (!ticketRes.ok) throw new Error(`websocket ticket: HTTP ${ticketRes.status}`);
+  const { ticket } = await ticketRes.json();
+  const ws = new WebSocket(`${T3_URL.replace(/^http/, "ws")}/ws?wsTicket=${encodeURIComponent(ticket)}`);
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.close();
+      reject(new Error("T3 did not answer within 2 minutes"));
+    }, 120_000);
+    ws.onopen = () =>
+      ws.send(JSON.stringify({ _tag: "Request", id: "1", tag: "orchestration.dispatchCommand", payload: command, headers: [] }));
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message._tag === "Ping") return ws.send(JSON.stringify({ _tag: "Pong" }));
+      if (message._tag !== "Exit") return;
+      clearTimeout(timer);
+      ws.close();
+      if (message.exit?._tag === "Success") resolve(message.exit.value);
+      else reject(new Error(`T3 refused the turn: ${JSON.stringify(message.exit?.cause ?? message.exit).slice(0, 500)}`));
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("could not connect to the T3 server"));
+    };
+  });
+}
+
+/** A new thread in a fresh revnu2 worktree, or a follow-up turn when threadId still exists. */
+async function sendToThread({ threadId, title, text }) {
+  return await withT3Session(async (token) => {
+    const snapshotRes = await t3(token, "/api/orchestration/snapshot");
+    if (!snapshotRes.ok) throw new Error(`T3 snapshot: HTTP ${snapshotRes.status}`);
+    const project = await findProject(await snapshotRes.json());
+    const modelSelection = project.defaultModelSelection ?? { instanceId: "claudeAgent", model: MODEL };
+    const now = new Date().toISOString();
+    const message = { messageId: randomUUID(), role: "user", text, attachments: [] };
+    const base = { type: "thread.turn.start", commandId: randomUUID(), message, modelSelection, runtimeMode: "full-access", interactionMode: "default", createdAt: now };
+
+    if (threadId && (await t3(token, `/api/orchestration/threads/${encodeURIComponent(threadId)}`)).ok) {
+      await dispatch(token, { ...base, threadId });
+      return threadId;
+    }
+    const id = randomUUID();
+    const baseBranch = "main";
+    await dispatch(token, {
+      ...base,
+      threadId: id,
+      bootstrap: {
+        createThread: { projectId: project.id, title, modelSelection, runtimeMode: "full-access", interactionMode: "default", branch: baseBranch, worktreePath: null, createdAt: now },
+        prepareWorktree: {
+          projectCwd: project.workspaceRoot,
+          baseBranch,
+          branch: `t3code/${randomBytes(4).toString("hex")}`,
+          startFromOrigin: true,
+          requireWorktree: true,
+        },
+        runSetupScript: true,
+      },
+    });
+    return id;
+  });
+}
+
+const READ_PROD = "doppler run --project revnu2-readonly --config prd -- bun investigate --prod";
+
+function firstMessage(c, p, windowStart) {
+  return [
+    `watch (REV-381) flagged a problem with ${c.name} (${c.id}) at ${fmt(Date.now())}.`,
+    "",
+    p.summary,
+    p.unsure ? "\nThe judge was unsure about this one: check it before treating it as real." : "",
+    "",
+    "Evidence:",
+    p.evidence,
+    "",
+    "Find the cause. Start with",
+    `\`${READ_PROD} --creator ${c.id} --since ${Math.ceil((Date.now() - windowStart) / 3600_000) + 1}h\``,
+    "(the revnu2-readonly token; this worktree's own env is dev) and steps 6-7 of the debrief skill.",
+    "Everything stays read-only: never write to prod, message the customer or change their account.",
+    "Say whether it's a bug, agent judgement, a product gap, a setup blocker or infra, whether main",
+    "already fixes it, and what the fix would be. Don't open a PR unless Art asks for one.",
+    "",
+    `If Art says this is fine, run \`~/.local/bin/watch ok ${slug(c.name)} ${p.key} "<why, in his words>"\``,
+    "so watch stops flagging it.",
+  ].join("\n");
+}
+
+function followUp(p) {
+  return [`watch: still happening at ${fmt(Date.now())}.`, "", p.summary, "", "New evidence:", p.evidence].join("\n");
+}
+
+// ---------- check ----------
+
+async function check(state, c, { since, dryRun = false } = {}) {
+  const now = Date.now();
+  const windowStart = since ? now - since : c.lastCheckedAt;
+  const g = await gather(c, now, windowStart);
+  const why = since ? `forced check of the last ${Math.round(since / 60_000)}m` : reasonToJudge(g, now, windowStart);
+  const result = { creator: c.name, window: `${fmt(windowStart)} → ${fmt(now)}`, why };
+  if (!why) {
+    console.log(`${c.name}: quiet since ${fmt(windowStart)}, skipped`);
+    if (!dryRun) c.lastCheckedAt = now;
+    return { ...result, skipped: true };
+  }
+
+  const open = Object.values(c.problems ?? {});
+  const notes = state.notes.filter((n) => n.creatorId === c.id);
+  const prompt = judgePrompt(c, g, why, open, notes);
+  const verdict = await judge(prompt);
+  console.log(`${c.name}: ${why}; judge says ${verdict.ok ? "ok" : `${verdict.problems.length} problem(s)`} ($${(verdict.costUsd ?? 0).toFixed(2)})`);
+  if (dryRun) {
+    writeFileSync(join(tmpdir(), `watch-prompt-${slug(c.name)}.md`), prompt);
+    return { ...result, verdict };
+  }
+
+  const seen = new Set();
+  for (const p of verdict.problems) {
+    seen.add(p.key);
+    const known = c.problems?.[p.key];
+    const threadId = await sendToThread({
+      threadId: known?.threadId,
+      title: `${c.name}: ${clip(p.title || p.summary, 80)}`,
+      text: known ? followUp(p) : firstMessage(c, p, windowStart),
+    });
+    c.problems = { ...c.problems, [p.key]: { key: p.key, summary: p.summary, threadId, openedAt: known?.openedAt ?? now, lastSeenAt: now } };
+    console.log(`  ${known ? "follow-up in" : "opened"} thread ${threadId}: ${p.key}`);
+  }
+  // A problem the judge no longer reports is over; if it comes back, it gets a fresh thread.
+  for (const key of Object.keys(c.problems ?? {})) if (!seen.has(key)) delete c.problems[key];
+  c.lastCheckedAt = now;
+  return { ...result, verdict };
+}
+
+// ---------- commands ----------
+
+async function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  const flag = (name) => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args.splice(i, 2)[1] : undefined;
+  };
+  const state = load();
+  const now = Date.now();
+
+  switch (cmd) {
+    case "add": {
+      const hit = await resolve(args.join(" "));
+      if (state.creators[hit.id]) return console.log(`already watching ${hit.name}`);
+      state.creators[hit.id] = { id: hit.id, name: hit.name, addedAt: now, lastCheckedAt: now, problems: {} };
+      save(state);
+      return console.log(`watching ${hit.name} (${hit.id}); first check ${fmt(now + EVERY_MS)}`);
+    }
+    case "rm": {
+      const c = findWatched(state, args.join(" "));
+      delete state.creators[c.id];
+      save(state);
+      return console.log(`stopped watching ${c.name}`);
+    }
+    case "ls": {
+      const list = Object.values(state.creators);
+      if (!list.length) return console.log("watching nobody");
+      for (const c of list) {
+        console.log(`${c.name.padEnd(20)} ${c.id}  added ${fmt(c.addedAt)}  last ${fmt(c.lastCheckedAt)}  next ${fmt(nextCheck(c, now))}`);
+        for (const p of Object.values(c.problems ?? {})) console.log(`    open: ${p.key} (thread ${p.threadId}) ${clip(p.summary, 80)}`);
+      }
+      return;
+    }
+    case "ok": {
+      const [who, key, ...why] = args;
+      if (!who || !key) throw new Error("usage: watch ok <creator> <key> [why]");
+      const c = findWatched(state, who);
+      state.notes.push({ creatorId: c.id, key, note: why.join(" ") || c.problems?.[key]?.summary || key, at: now });
+      delete c.problems?.[key];
+      save(state);
+      return console.log(`noted: ${c.name} ${key} is fine`);
+    }
+    case "check": {
+      const sinceArg = flag("--since");
+      const dryRun = args.includes("--dry-run");
+      const c = findWatched(state, args.filter((a) => a !== "--dry-run").join(" "));
+      const m = sinceArg?.match(/^(\d+)([mhd])$/);
+      if (sinceArg && !m) throw new Error("--since expects e.g. 90m / 6h / 2d");
+      const since = m ? Number(m[1]) * { m: 60_000, h: 3600_000, d: 86_400_000 }[m[2]] : undefined;
+      return await withLock(async () => {
+        await refreshClone();
+        const fresh = load();
+        const result = await check(fresh, fresh.creators[c.id], { since, dryRun });
+        if (!dryRun) save(fresh);
+        console.log(JSON.stringify(result, null, 2));
+      });
+    }
+    case "tick": {
+      const due = Object.values(state.creators).filter((c) => isDue(c, now));
+      if (!due.length) return;
+      return await withLock(async () => {
+        await refreshClone();
+        for (const { id } of due) {
+          const fresh = load();
+          const c = fresh.creators[id];
+          if (!c) continue;
+          try {
+            await check(fresh, c);
+          } catch (err) {
+            // Retried next tick: lastCheckedAt only moves on success.
+            console.error(`${c.name}: check failed: ${err.message}`);
+          }
+          save(fresh);
+        }
+      });
+    }
+    default:
+      console.log("usage: watch add|rm|ls|ok|check|tick (see the header of this file)");
+  }
+}
+
+main().catch((err) => {
+  console.error(err.message);
+  process.exit(1);
+});
