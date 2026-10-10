@@ -28,6 +28,7 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `docs/machines.md` | the running record: what's on each machine, where credentials live, past incidents |
 | `reapers/` | systemd user timers that stop forgotten dev stacks and orphaned Convex executors |
 | `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
+| `watch/` | babysits a few revnu creators every 3 hours and opens a T3 thread per problem (skynet) |
 | `mac/` | launchd job: `box sync-memory` every 6 hours (never starts Tailscale) |
 
 Paths only, never secret values. Machine-local state (FreeRDP logs, `.rdp` files) stays in
@@ -63,3 +64,30 @@ hostnames, one per line), then `systemctl --user enable --now box-heartbeat.time
 `~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u) <that file>`. Background jobs can't read
 `~/Documents`, so `box` keeps a copy of itself and `machines` in `~/.local/share/box`, refreshed each
 time you run it; the job runs that copy. Log: `/tmp/box-sync-memory.log`.
+
+## Watch
+
+`watch` (skynet) babysits a short list of revnu creators. Each one is checked every 3 hours,
+counted from when it was added; a 15-minute timer runs whoever is due. A check reads everything
+since the last one (with the day before as context) through `bun investigate` and `bun ops`, and
+Opus judges it against the creator's Memory (`watch/judge.md`). A quiet window is skipped unless
+the quiet is the problem: a customer message with no reply, or nothing shipped in 24 hours. Each
+problem opens a T3 thread in the revnu2 project on the box; the same problem at the next check
+becomes a follow-up turn in that thread, and a problem that stops showing up is closed.
+
+```
+watch add <creator>            resolve by name like `bun ops` (substring of the business name)
+watch rm <creator>
+watch ls                       last and next check, open problems and their threads
+watch ok <creator> <key> [why] "that's fine": closes it and the judge stops flagging it
+watch check <creator> [--since 6h] [--dry-run]   check now; --dry-run judges but opens nothing
+```
+
+It is read-only. Prod is read with the `revnu2-readonly/prd` Doppler token in a clone with no
+`.env.local`, so nothing it runs can write or message a customer; the clone is reset to
+`origin/main` before each run. The threads it opens get the same read-only instruction.
+
+Install on skynet: copy `watch/watch` and `watch/judge.md` to `~/.local/share/watch/bin/`, symlink
+`~/.local/bin/watch` to the script, clone revnu2 to `~/.local/share/watch/revnu2` and `bun install`
+there, copy the unit and timer to `~/.config/systemd/user/`, then
+`systemctl --user enable --now watch.timer`. Needs `doppler login`, `claude` and `t3` on the box.
