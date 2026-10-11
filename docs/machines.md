@@ -33,8 +33,8 @@ LAN name, otherwise Tailscale). SSH is key-only from this Mac (`~/.ssh/id_ed2551
 `~/.ssh/config` on each box has aliases for the others (`skynet`, `jarvis`, `mac`): the home network first,
 then Tailscale, with `StrictHostKeyChecking accept-new`. On the boxes, `box` is this repo cloned at
 `~/Documents/projects/box` and symlinked into `~/.local/bin` (on PATH in login shells only; `box update` also
-pulls it). `box` knows which machine it's on, so `box status all` runs locally for that one. `desktop`, `proxy` and
-`hermes` open windows, so they're Mac-only. The Mac counts as a machine (role `mac`), but the boxes can only reach it
+pulls it). `box` knows which machine it's on, so `box status all` runs locally for that one. `desktop` and `proxy`
+open windows, so they're Mac-only. The Mac counts as a machine (role `mac`), but the boxes can only reach it
 when **Remote Login** is on in System Settings → General → Sharing; that toggle needs Art's admin password.
 New machine: create its key, add it to every other machine's `authorized_keys` (and theirs to its own), add the ssh
 aliases, then clone this repo and add the symlink.
@@ -55,7 +55,6 @@ box claude-login    add or re-auth a Claude account in the proxy
 box update          apt upgrade + t3/claude/codex/bun updates
 box sync-memory     two-way sync of revnu2 Claude memories (newer file wins)
 box reboot          reboot, wait, show status
-box hermes          Hermes Agent dashboard, tunnelled to http://localhost:9119
 ```
 
 Each tries the home network first and starts Tailscale on the Mac if that fails.
@@ -301,6 +300,6 @@ Nous Research's personal agent, installed to look around in. **No tasks, cron jo
   Primary `claude-sonnet-5-5`, fallback `claude-haiku-4-5-20251001`. It shares the Claude accounts' limits with the
   coding agents: when they're spent it drops to Haiku.
 - Dashboard: `hermes-dashboard.service` (systemd user unit) on `127.0.0.1:9119` only. A non-loopback bind needs an
-  auth provider (password/OAuth), so reach it with `box hermes` (SSH tunnel), never by binding 0.0.0.0.
+  auth provider (password/OAuth), so reach it with an SSH tunnel (`ssh -L 9119:localhost:9119 skynet`), never by binding 0.0.0.0.
 - Messaging isn't configured. Telegram/WhatsApp/Slack/Discord/Signal via `hermes gateway setup`; iMessage via
   BlueBubbles (needs an always-on Mac) or Photon (`hermes photon setup --phone ...`, no Mac).

@@ -5,7 +5,6 @@
 
 USER_NAME="art"
 PROXY_LOCAL_PORT=24874
-HERMES_LOCAL_PORT=9119
 CONF_DIR="$HOME/.config/agentbox"
 MACHINES_FILE="${BOX_MACHINES:-${0:A:h}/../machines}"
 # Background jobs (launchd) can't read ~/Documents, so keep a runnable copy outside it.
@@ -168,16 +167,6 @@ EOF
 
 cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LOCAL_PORT" && say "proxy tunnel closed"; }
 
-# The Hermes dashboard binds loopback only on the box (a public bind needs an auth provider), so tunnel it.
-cmd_hermes() {
-  need_mac hermes && need_box hermes || return 1
-  local h; h=$(resolve) || return 1
-  if ! reachable localhost "$HERMES_LOCAL_PORT"; then
-    ssh -f -N -o ExitOnForwardFailure=yes -L "${HERMES_LOCAL_PORT}:localhost:9119" "$USER_NAME@$h" || return 1
-  fi
-  open "http://localhost:$HERMES_LOCAL_PORT"
-}
-
 cmd_status() {
   local h; h=$(resolve) || return 1
   case $h in self) say "this machine" ;; ${M_LAN[$TARGET]}) say "reachable on home network" ;; *) say "reachable via Tailscale" ;; esac
@@ -262,25 +251,41 @@ cmd_update() {
   ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade" && systemctl --user restart t3code'
 }
 
-cmd_help() {
-  cat <<EOF
-box [machine]                 shell on a machine (tmux session "main", survives disconnects)
-box list                      the registered machines and whether they're reachable now
-box desktop [machine]         open its Ubuntu desktop (FreeRDP; --windows-app for the old client)
-box status [machine|all]      health check: services, Claude, battery, T3 Connect, disk
-box run [machine] <cmd>       run one command
-box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
-box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
-box reboot [machine]          reboot and wait until it's back, then show status
-box sync-memory               two-way sync of revnu2 Claude memories with every machine (newer file wins)
-box usage                     5-hour and weekly use per Claude account, and when each resets
-box proxy                     CLIProxyAPI dashboard (key copied to clipboard)
-box proxy-close               close the dashboard tunnel
-box claude-login              add or re-auth a Claude account in the proxy
-box hermes [machine]          Hermes Agent dashboard (tunnelled to localhost:9119)
+# What each machine is for, shown in `box help`.
+describe() {
+  if has_role $1 mac; then echo "Art's MacBook, the main machine. Art works here; be careful with it."
+  elif has_role $1 proxy; then echo "agent box (Ubuntu), the default; holds the Claude accounts (CLIProxyAPI)"
+  else echo "agent box (Ubuntu); Claude goes through skynet's proxy"; fi
+}
 
-Machines: ${(j:, :)M_NAMES} (this is ${SELF:-unregistered}). Default: $(machine_with_role default). Register one in $MACHINES_FILE.
-Works the same from any machine; desktop, proxy and hermes open windows, so they're Mac-only.
+cmd_help() {
+  local n
+  cat <<EOF
+These are Art's machines. All of them can reach each other, and every one has this CLI:
+
+EOF
+  for n in $M_NAMES; do printf "  %-8s %s%s\n" $n "$(describe $n)" "$([[ $n == $SELF ]] && echo '  <- you are here')"; done
+  cat <<EOF
+
+The MacBook is the master: it's where Art works, and the boxes do the long-running agent work.
+Reach any machine from any other, home network first and Tailscale otherwise:
+  ssh <machine>                 plain SSH (e.g. ssh jarvis), key-based, no password
+  box <machine>                 a shell that survives disconnects (tmux "main")
+  box run <machine> <cmd>       one command, e.g. box run jarvis 'nproc; free -g'
+
+Commands ([machine] defaults to $(machine_with_role default); "all" means every machine):
+  box list                      every machine and whether it's reachable right now
+  box status [machine|all]      health check: services, Claude, battery, T3 Connect, disk
+  box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
+  box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
+  box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
+  box sync-memory               two-way sync of revnu2 Claude memories with every machine
+  box usage                     5-hour and weekly use per Claude account
+  box claude-login              add or re-auth a Claude account in the proxy (needs Art in a browser)
+  box desktop [machine]         a box's Ubuntu desktop (Mac only)
+  box proxy | proxy-close       CLIProxyAPI dashboard (Mac only)
+
+Machines are listed in ${MACHINES_FILE:A}. Full notes: ${MACHINES_FILE:A:h}/docs/machines.md
 EOF
 }
 
@@ -306,7 +311,6 @@ case $cmd in
   run) run "${args[@]}" ;;
   logs|l) cmd_logs "${args[1]}" ;;
   claude-login) cmd_claude_login ;;
-  hermes|h) cmd_hermes ;;
   usage|u) cmd_usage ;;
   update) each cmd_update ;;
   sync-memory) cmd_sync_memory ;;
