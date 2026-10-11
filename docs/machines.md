@@ -26,7 +26,19 @@ Everything here is reachable from the Mac with the `box` script (`~/.local/bin/b
 LAN name, otherwise Tailscale). SSH is key-only from this Mac (`~/.ssh/id_ed25519`).
 `art` has passwordless sudo (`/etc/sudoers.d/art-nopasswd`) so agents can administer it.
 
-## The `box` script (on the Mac)
+## The `box` script (every machine)
+
+**Fleet, since 2026-10-11:** every machine can SSH to every other and has `box`. Each one has its own key at
+`~/.ssh/id_ed25519` (comment `art@<host> fleet`), and every machine's `authorized_keys` lists the other machines' keys.
+`~/.ssh/config` on each box has aliases for the others (`skynet`, `jarvis`, `mac`): the home network first,
+then Tailscale, with `StrictHostKeyChecking accept-new`. On the boxes, `box` is this repo cloned at
+`~/Documents/projects/box` and symlinked into `~/.local/bin` (on PATH in login shells only; `box update` also
+pulls it). `box` knows which machine it's on, so `box status all` runs locally for that one. `desktop`, `proxy` and
+`hermes` open windows, so they're Mac-only. The Mac counts as a machine (role `mac`), but the boxes can only reach it
+when **Remote Login** is on in System Settings → General → Sharing; that toggle needs Art's admin password.
+New machine: create its key, add it to every other machine's `authorized_keys` (and theirs to its own), add the ssh
+aliases, then clone this repo and add the symlink.
+
 
 Since 2026-10-02 one CLI drives every machine listed in `machines` (skynet is the
 default). Name a machine anywhere: `box desktop jarvis`, `box jarvis status`, `box status all`, `box list`.
@@ -242,8 +254,8 @@ because stacks die when it sleeps/reboots, and macOS compresses memory before sw
 
 ## Second box: jarvis (2026-10-02)
 
-Dell Precision 5550 laptop (12 threads, 30 GB, 937 GB), Ubuntu 26.04, user `art`, `ssh jarvis` (home network,
-`jarvis.local`, Wi-Fi only so far). T3 Connect environment "jarvis".
+Dell Precision 5550 laptop (12 threads, 30 GB, 937 GB), Ubuntu 26.04, user `art`, `ssh jarvis` (home network
+`jarvis.local` first, then Tailscale; Wi-Fi only). T3 Connect environment "jarvis".
 - Always-on: sleep masked, `HandleLidSwitch*=ignore` in `/etc/systemd/logind.conf.d/lid.conf`, GNOME idle off,
   auto-login, linger, inotify raised, Wi-Fi power save off.
 - Battery capped 75-80% by `battery-limit.service` (it is always plugged in).
