@@ -1,6 +1,6 @@
 #!/bin/zsh
-# box — drive Art's always-on agent machines from this Mac.
-# Machines are listed in ~/.config/agentbox/machines; the "default" one is used when none is named.
+# box — drive Art's machines (the agent boxes and the Mac) from any one of them.
+# Machines are listed in ../machines; the "default" one is used when none is named.
 # Every command tries the home network first, then Tailscale (starting it on the Mac if needed).
 
 USER_NAME="art"
@@ -16,8 +16,7 @@ if [[ ${0:A} == */bin/box && -r ${0:A:h}/../machines ]]; then
   cmp -s "${0:A:h}/../machines" "$SHADOW/machines" || cp "${0:A:h}/../machines" "$SHADOW/machines"
 fi
 TS="/usr/local/bin/tailscale"
-MAC_MEMORY="$HOME/.claude/projects/-Users-art-Documents-projects-revnu2/memory/"
-BOX_MEMORY=".claude/projects/-home-art-Documents-projects-revnu2/memory/"
+[[ $OSTYPE == darwin* ]] && ON_MAC=1 || ON_MAC=0
 
 typeset -A M_LAN M_TS M_ROLES
 M_NAMES=()
@@ -29,18 +28,26 @@ done < "$MACHINES_FILE"
 has_role() { [[ ",${M_ROLES[$1]}," == *",$2,"* ]]; }
 machine_with_role() { local n; for n in $M_NAMES; do has_role $n $1 && { echo $n; return; }; done; }
 is_machine() { (( ${M_NAMES[(Ie)$1]} )); }
+# The machine this is running on: matched by hostname, or the "mac" role on macOS.
+if (( ON_MAC )); then SELF=$(machine_with_role mac); else SELF=${${(L)$(hostname -s)}}; is_machine $SELF || SELF=""; fi
+# revnu2's Claude memory folder, relative to home; Claude names it after the checkout path.
+memory_dir() { has_role $1 mac && echo .claude/projects/-Users-art-Documents-projects-revnu2/memory/ \
+  || echo .claude/projects/-home-art-Documents-projects-revnu2/memory/; }
 
 TARGET=""
 say() { print -P "%F{cyan}${TARGET:-box}%f $*" >&2; }
 
-reachable() { nc -z -G "${3:-2}" "$1" "$2" >/dev/null 2>&1; }
+if (( ON_MAC )); then reachable() { nc -z -G "${3:-2}" "$1" "$2" >/dev/null 2>&1; }
+else reachable() { nc -z -w "${3:-2}" "$1" "$2" >/dev/null 2>&1; }; fi
 
-# Prints the address to use for $TARGET; starts Tailscale when the home network fails.
+# Prints the address to use for $TARGET ("self" for this machine); starts Tailscale when the home network fails.
 resolve() {
   local port=${1:-22} lan=${M_LAN[$TARGET]} ts=${M_TS[$TARGET]}
+  [[ $TARGET == $SELF ]] && { echo self; return; }
   if reachable "$lan" "$port"; then echo "$lan"; return; fi
   [[ -z $ts || $ts == - ]] && { say "can't reach $lan. Is it on?"; return 1; }
   if reachable "$ts" "$port"; then say "via Tailscale"; echo "$ts"; return; fi
+  (( ON_MAC )) || { say "can't reach $TARGET (home network or Tailscale). Is it on?"; return 1; }
   [[ -n ${BOX_NO_TS_START:-} ]] && { say "not reachable without starting Tailscale, skipped"; return 1; }
   say "not on home network, starting Tailscale..."
   pgrep -xq Tailscale || open -ga Tailscale
@@ -54,7 +61,16 @@ resolve() {
   return 1
 }
 
-run() { local h; h=$(resolve) || return 1; ssh -o BatchMode=yes "$USER_NAME@$h" "$@"; }
+# on <host> <cmd...>: run on a resolved host, locally when it's this machine. `ont` gives it a terminal.
+on()  { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -T -o BatchMode=yes "$USER_NAME@$h" "$@"; }
+ont() { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -t "$USER_NAME@$h" "$@"; }
+
+run() { local h; h=$(resolve) || return 1; on "$h" "$@"; }
+
+# Commands that drive the Ubuntu services; the Mac has none of them.
+need_box() { has_role $TARGET mac || return 0; say "is the Mac; \`box $1\` is for the Linux boxes"; return 1; }
+# Commands that open a window or the clipboard on this computer.
+need_mac() { (( ON_MAC )) && return; say "\`box $1\` opens a window, so run it from the Mac"; return 1; }
 
 need_role() {
   has_role $TARGET $1 && return
@@ -64,17 +80,20 @@ need_role() {
 
 cmd_list() {
   local n where
-  printf "%-10s %-16s %-17s %-16s %s\n" MACHINE LAN TAILSCALE ROLES NOW
+  printf "%-10s %-24s %-17s %-16s %s\n" MACHINE LAN TAILSCALE ROLES NOW
   for n in $M_NAMES; do
-    if reachable "${M_LAN[$n]}" 22 1; then where="home network"
+    if [[ $n == $SELF ]]; then where="this machine"
+    elif reachable "${M_LAN[$n]}" 22 1; then where="home network"
     elif [[ ${M_TS[$n]} != - ]] && reachable "${M_TS[$n]}" 22 1; then where="via Tailscale"
     else where="unreachable"; fi
-    printf "%-10s %-16s %-17s %-16s %s\n" $n ${M_LAN[$n]} ${M_TS[$n]} ${M_ROLES[$n]} "$where"
+    printf "%-10s %-24s %-17s %-16s %s\n" $n ${M_LAN[$n]} ${M_TS[$n]} ${M_ROLES[$n]} "$where"
   done
 }
 
 cmd_ssh() {
   local h; h=$(resolve) || return 1
+  [[ $h == self ]] && { say "is this machine"; return; }
+  has_role $TARGET mac && { ssh -t "$USER_NAME@$h"; return; }
   # tmux keeps the shell alive if the connection drops; reattach with `box` again.
   ssh -t "$USER_NAME@$h" 'tmux new -A -s main'
 }
@@ -82,6 +101,7 @@ cmd_ssh() {
 # FreeRDP by default: the Windows App dropped every session after ~1 min against GNOME's RDP
 # server (0x200d), FreeRDP held. Password comes from the Keychain item "agentbox-rdp".
 cmd_desktop() {
+  need_mac desktop && need_box desktop || return 1
   [[ $1 == --windows-app ]] && { cmd_desktop_windows_app; return; }
   local h pw; h=$(resolve 3389) || return 1
   pw=$(security find-generic-password -a "$USER_NAME" -s agentbox-rdp -w 2>/dev/null) || {
@@ -113,12 +133,13 @@ EOF
 }
 
 cmd_proxy() {
+  need_mac proxy || return 1
   need_role proxy "the Claude proxy lives on" proxy || return 1
   local h; h=$(resolve) || return 1
   if ! reachable localhost "$PROXY_LOCAL_PORT"; then
     ssh -f -N -o ExitOnForwardFailure=yes -L "${PROXY_LOCAL_PORT}:localhost:24873" "$USER_NAME@$h" || return 1
   fi
-  ssh -o BatchMode=yes "$USER_NAME@$h" 'cat ~/.cli-proxy-api/management-key' | tr -d '\n' | pbcopy
+  on "$h" 'cat ~/.cli-proxy-api/management-key' | tr -d '\n' | pbcopy
   say "management key copied to clipboard"
   open "http://localhost:$PROXY_LOCAL_PORT/management.html"
 }
@@ -127,7 +148,7 @@ cmd_proxy() {
 cmd_usage() {
   need_role proxy "Claude accounts live on" usage || return 1
   local h; h=$(resolve) || return 1
-  ssh -T -o BatchMode=yes "$USER_NAME@$h" 'bash -s' <<'EOF'
+  on "$h" 'bash -s' <<'EOF'
 K=$(cat ~/.cli-proxy-api/management-key)
 curl -s -H "Authorization: Bearer $K" http://127.0.0.1:24873/v0/management/auth-files | jq -r '
   def when: (tonumber - now) as $s | if $s <= 0 then "now" elif $s < 86400 then "in \(($s/3600)|floor)h\((($s%3600)/60)|floor)m" else "in \(($s/86400)|floor)d\((($s%86400)/3600)|floor)h" end;
@@ -149,6 +170,7 @@ cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LO
 
 # The Hermes dashboard binds loopback only on the box (a public bind needs an auth provider), so tunnel it.
 cmd_hermes() {
+  need_mac hermes && need_box hermes || return 1
   local h; h=$(resolve) || return 1
   if ! reachable localhost "$HERMES_LOCAL_PORT"; then
     ssh -f -N -o ExitOnForwardFailure=yes -L "${HERMES_LOCAL_PORT}:localhost:9119" "$USER_NAME@$h" || return 1
@@ -158,8 +180,17 @@ cmd_hermes() {
 
 cmd_status() {
   local h; h=$(resolve) || return 1
-  [[ $h == "${M_LAN[$TARGET]}" ]] && say "reachable on home network" || say "reachable via Tailscale"
-  ssh -T -o BatchMode=yes "$USER_NAME@$h" 'bash -s' <<'EOF'
+  case $h in self) say "this machine" ;; ${M_LAN[$TARGET]}) say "reachable on home network" ;; *) say "reachable via Tailscale" ;; esac
+  if has_role $TARGET mac; then
+    on "$h" 'bash -s' <<'EOF'
+echo "uptime      $(uptime | sed "s/.*up \([^,]*\),.*/\1/")"
+echo "macOS       $(sw_vers -productVersion)"
+echo "battery     $(pmset -g batt | grep -o "[0-9]*%.*;" | head -1)"
+echo "disk        $(df -h / | awk 'NR==2{print $3" used / "$2}')"
+EOF
+    return
+  fi
+  on "$h" 'bash -s' <<'EOF'
 ok() { [ "$1" = active ] && printf "\e[32m%s\e[0m" "$1" || printf "\e[31m%s\e[0m" "$1"; }
 echo "uptime      $(uptime -p)"
 echo "t3 code     $(ok $(systemctl --user is-active t3code))"
@@ -183,9 +214,11 @@ EOF
 }
 
 cmd_reboot() {
+  need_box reboot || return 1
   local h; h=$(resolve) || return 1
+  [[ $h == self ]] && { say "is this machine; reboot it from another one"; return 1; }
   say "rebooting..."
-  ssh -o BatchMode=yes "$USER_NAME@$h" 'sudo systemctl reboot' 2>/dev/null
+  on "$h" 'sudo systemctl reboot' 2>/dev/null
   sleep 20
   for _ in {1..40}; do reachable "$h" 22 && break; sleep 3; done
   sleep 15
@@ -193,35 +226,40 @@ cmd_reboot() {
 }
 
 cmd_logs() {
+  need_box logs || return 1
   local unit=${1:-t3code} h; h=$(resolve) || return 1
-  ssh -t "$USER_NAME@$h" "journalctl --user -u $unit -n 100 -f"
+  ont "$h" "journalctl --user -u $unit -n 100 -f"
 }
 
 cmd_claude_login() {
   need_role proxy "Claude accounts live on" claude-login || return 1
   local h; h=$(resolve) || return 1
   say "sign in on the page that opens in your browser"
+  [[ $h == self ]] && { ~/.local/bin/cliproxyapi -config ~/.config/cliproxyapi/config.yaml -claude-login -no-browser; return; }
   ssh -t -L 54545:localhost:54545 "$USER_NAME@$h" '~/.local/bin/cliproxyapi -config ~/.config/cliproxyapi/config.yaml -claude-login -no-browser'
 }
 
 # Two-way sync of revnu2's Claude memories with every reachable machine; the newer copy of each file wins.
 cmd_sync_memory() {
-  local n h synced=()
+  local n h r synced=() mine="$HOME/$(memory_dir $SELF)"
+  mkdir -p "$mine"
   for n in $M_NAMES; do
-    TARGET=$n
+    [[ $n == $SELF ]] && continue
+    TARGET=$n; r=$(memory_dir $n)
     h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
-    ssh -o BatchMode=yes "$USER_NAME@$h" "mkdir -p ~/$BOX_MEMORY" || continue
-    rsync -au "$MAC_MEMORY" "$USER_NAME@$h:$BOX_MEMORY" && rsync -au "$USER_NAME@$h:$BOX_MEMORY" "$MAC_MEMORY" && synced+=($n)
+    on "$h" "mkdir -p ~/$r" || continue
+    rsync -au "$mine" "$USER_NAME@$h:$r" && rsync -au "$USER_NAME@$h:$r" "$mine" && synced+=($n)
   done
   # Second pass so a newer file pulled from a later machine reaches the earlier ones too.
-  for n in $synced; do TARGET=$n; h=$(resolve 2>/dev/null) && rsync -au "$MAC_MEMORY" "$USER_NAME@$h:$BOX_MEMORY"; done
+  for n in $synced; do TARGET=$n; h=$(resolve 2>/dev/null) && rsync -au "$mine" "$USER_NAME@$h:$(memory_dir $n)"; done
   TARGET=""
-  say "memories synced with ${(j:, :)synced:-nothing} ($(ls "$MAC_MEMORY" | grep -vc MEMORY.md) files)"
+  say "memories synced with ${(j:, :)synced:-nothing} ($(ls "$mine" | grep -vc MEMORY.md) files)"
 }
 
 cmd_update() {
+  need_box update || return 1
   local h; h=$(resolve) || return 1
-  ssh -t "$USER_NAME@$h" 'sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade" && systemctl --user restart t3code'
+  ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade" && systemctl --user restart t3code'
 }
 
 cmd_help() {
@@ -232,7 +270,7 @@ box desktop [machine]         open its Ubuntu desktop (FreeRDP; --windows-app fo
 box status [machine|all]      health check: services, Claude, battery, T3 Connect, disk
 box run [machine] <cmd>       run one command
 box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
-box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun
+box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
 box reboot [machine]          reboot and wait until it's back, then show status
 box sync-memory               two-way sync of revnu2 Claude memories with every machine (newer file wins)
 box usage                     5-hour and weekly use per Claude account, and when each resets
@@ -241,7 +279,8 @@ box proxy-close               close the dashboard tunnel
 box claude-login              add or re-auth a Claude account in the proxy
 box hermes [machine]          Hermes Agent dashboard (tunnelled to localhost:9119)
 
-Machines: ${(j:, :)M_NAMES}. Default: $(machine_with_role default). Register one in $MACHINES_FILE.
+Machines: ${(j:, :)M_NAMES} (this is ${SELF:-unregistered}). Default: $(machine_with_role default). Register one in $MACHINES_FILE.
+Works the same from any machine; desktop, proxy and hermes open windows, so they're Mac-only.
 EOF
 }
 

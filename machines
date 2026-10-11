@@ -1,5 +1,7 @@
 # Machines `box` knows about. One per line; add a machine by adding a line.
 # name    lan host        tailscale ip      roles: default = used when no machine is named,
 #                                                  proxy = runs CLIProxyAPI (Claude accounts live there)
+#                                                  mac = Art's MacBook (no Ubuntu services; reachable once Remote Login is on)
 skynet    skynet.local    100.85.99.101     default,proxy
 jarvis    jarvis.local    100.123.203.103   -
+mac       arts-MacBook-Pro.local 100.76.37.10 mac
