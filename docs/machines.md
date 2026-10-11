@@ -56,7 +56,7 @@ All are systemd **user** services with linger on, so they start at boot with nob
 | Service | Unit | Notes |
 |---|---|---|
 | T3 Code server | `t3code.service` | `t3 service status`, logs `~/.t3/userdata/logs/boot-service.log`. If T3 Connect ever shows "pending server startup", `systemctl --user restart t3code` |
-| CLIProxyAPI | `cliproxyapi.service` | `0.0.0.0:24873` (LAN, for jarvis; API key required), fill-first across 3 Claude accounts (since 2026-10-02; backup config `*.bak-2026-10-02`). Dashboard on the box: http://localhost:24873/management.html |
+| CLIProxyAPI | `cliproxyapi.service` | `0.0.0.0:24873` (LAN, for jarvis; API key required), round-robin + session affinity across 4 Claude accounts (since 2026-10-11; fill-first piled ~57 parallel agents onto one account and cascaded rate-limit cooldowns across all of them). Cooldowns are not cleared when an account gets a manual reset: re-enable the credential (management API `PATCH auth-files/status` disabled true→false) or restart the proxy. Dashboard on the box: http://localhost:24873/management.html |
 | Remote desktop | `gnome-remote-desktop.service` | RDP on 3389, user `art`. `screen-share-mode=extend`: each session gets its own virtual monitor, since no physical display is attached |
 | Tailscale | `tailscaled` (system) | Advertised as an **exit node** since 2026-09-27 (forwarding in `/etc/sysctl.d/99-tailscale.conf`); approve it in the admin console |
 | watch | `watch.timer` | Every 15 min; checks watched revnu creators that are due (`watch/`, REV-381). State `~/.local/state/watch/state.json`, its own revnu2 clone `~/.local/share/watch/revnu2`, logs `journalctl --user -u watch` |

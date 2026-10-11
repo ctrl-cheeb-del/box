@@ -207,7 +207,7 @@ function judgePrompt(c, g, why, openProblems, notes) {
     `# Creator: ${c.name} (${c.id}), plan ${g.record.plan}, time zone ${g.record.timeZone}`,
     `Checked at ${fmt(Date.now())}. Why this check runs: ${why}.`,
     `# Their Memory\n${clip(memory, 25_000) || "(empty)"}`,
-    `# Open problems already reported (reuse the key if it's the same problem)\n${openProblems.length ? openProblems.map((p) => `- ${p.key}: ${p.summary}`).join("\n") : "(none)"}`,
+    `# Already handed to a thread (reuse the key if it happens again)\n${openProblems.length ? openProblems.map((p) => `- ${p.key} (reported ${fmt(p.lastSeenAt)}): ${p.summary}`).join("\n") : "(none)"}`,
     `# Art said these are fine: do not flag them\n${notes.length ? notes.map((n) => `- ${n.key}: ${n.note}`).join("\n") : "(none)"}`,
     `# Turn verdicts in the new window (bun investigate)\n${clip(g.verdicts, 15_000)}`,
     `# Timeline (UTC; rows above the NEW marker are context you already reviewed)\n${g.timeline.text}`,
@@ -362,8 +362,9 @@ function firstMessage(c, p, windowStart) {
     "Say whether it's a bug, agent judgement, a product gap, a setup blocker or infra, whether main",
     "already fixes it, and what the fix would be. Don't open a PR unless Art asks for one.",
     "",
-    `If Art says this is fine, run \`~/.local/bin/watch ok ${slug(c.name)} ${p.key} "<why, in his words>"\``,
-    "so watch stops flagging it.",
+    "watch has handed this off to you and won't bring it up again unless it happens again after now;",
+    "a repeat comes back to this thread. If Art says the pattern itself is fine and should never be flagged, run",
+    `\`~/.local/bin/watch ok ${slug(c.name)} ${p.key} "<why, in his words>"\`.`,
   ].join("\n");
 }
 
@@ -407,8 +408,9 @@ async function check(state, c, { since, dryRun = false } = {}) {
     c.problems = { ...c.problems, [p.key]: { key: p.key, summary: p.summary, threadId, openedAt: known?.openedAt ?? now, lastSeenAt: now } };
     console.log(`  ${known ? "follow-up in" : "opened"} thread ${threadId}: ${p.key}`);
   }
-  // A problem the judge no longer reports is over; if it comes back, it gets a fresh thread.
-  for (const key of Object.keys(c.problems ?? {})) if (!seen.has(key)) delete c.problems[key];
+  // Opening the thread resolves it: the judge only re-reports on evidence after lastSeenAt.
+  // A week without a repeat drops the key, so a much later recurrence gets a fresh thread.
+  for (const [key, p] of Object.entries(c.problems ?? {})) if (!seen.has(key) && now - p.lastSeenAt > 7 * 86_400_000) delete c.problems[key];
   c.lastCheckedAt = now;
   return { ...result, verdict };
 }
@@ -443,7 +445,7 @@ async function main() {
       if (!list.length) return console.log("watching nobody");
       for (const c of list) {
         console.log(`${c.name.padEnd(20)} ${c.id}  added ${fmt(c.addedAt)}  last ${fmt(c.lastCheckedAt)}  next ${fmt(nextCheck(c, now))}`);
-        for (const p of Object.values(c.problems ?? {})) console.log(`    open: ${p.key} (thread ${p.threadId}) ${clip(p.summary, 80)}`);
+        for (const p of Object.values(c.problems ?? {})) console.log(`    handed off ${fmt(p.lastSeenAt)}: ${p.key} (thread ${p.threadId}) ${clip(p.summary, 80)}`);
       }
       return;
     }

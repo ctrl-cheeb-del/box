@@ -45,9 +45,12 @@ false alarm than miss a real one. Don't flag what you can't point at in the data
 
 Each problem has a short kebab-case `key` naming the problem, not the day it happened
 (`ignored-pricing-correction`, `no-reply-to-customer`, `blog-publish-failing`). If a
-problem matches one under "Open problems already reported", reuse that exact key: the
-report goes into the same thread. If an open problem is still happening, report it again
-with the same key and the new evidence.
+problem matches one under "Already handed to a thread", reuse that exact key: the
+report goes into the same thread.
+
+A problem already handed to a thread is being dealt with. Report it again only when
+there is new evidence dated after it was reported (it happened again); never re-report it
+from rows it was already reported on, or because nothing has fixed it yet.
 
 ## Output
 
