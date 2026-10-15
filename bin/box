@@ -199,7 +199,8 @@ systemctl list-unit-files tailscaled.service >/dev/null 2>&1 && echo "tailscale 
 systemctl --user list-unit-files gnome-remote-desktop.service 2>/dev/null | grep -q enabled && echo "remote desk $(ok $(systemctl --user is-active gnome-remote-desktop))"
 [ -d /sys/class/power_supply/BAT0 ] && echo "battery     $(cat /sys/class/power_supply/BAT0/capacity)% $(cat /sys/class/power_supply/BAT0/status) (cap $(cat /sys/class/power_supply/BAT0/charge_control_end_threshold)%)"
 echo "t3 connect  $(sh -lc 't3 connect status 2>/dev/null' | grep -E 'Exposure' | sed 's/.*: //')"
-echo "memory      $(free -h | awk '/Mem/{print $3" used / "$2}')"
+echo "memory      $(free -h | awk '/Mem/{print $3" used / "$2} /Swap/{print "(swap "$3" / "$2")"}' | paste -sd' ')"
+command -v sensors >/dev/null && echo "cpu temp    $(sensors 2>/dev/null | awk '/^Package id 0:/{print $4; exit}')"
 echo "disk        $(df -h / | awk 'NR==2{print $3" used / "$2}')"
 EOF
 }

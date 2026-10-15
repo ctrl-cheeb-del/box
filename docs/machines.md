@@ -278,6 +278,15 @@ Dell Precision 5550 laptop (12 threads, 30 GB, 937 GB), Ubuntu 26.04, user `art`
 - 2026-10-02: Tailscale on jarvis (`100.123.203.103`, exit node advertised, forwarding in `/etc/sysctl.d/99-tailscale.conf`).
   Claude on jarvis now uses skynet's proxy by Tailscale IP (`http://100.85.99.101:24873`), so it works away from home.
   `box ... jarvis` falls back to Tailscale. Remote desktop on jarvis: same Keychain password (`agentbox-rdp`). RAM: 2x16 GB DDR4 SODIMM, max 64 GB.
+- 2026-10-15 outage (12:01-13:29): ~a dozen revnu2 threads each ran `tsc -b` (0.6-2.5 GB apiece) at once, filling
+  30 GB RAM + 23 GB swap (zram + `/swap.img`). The box thrashed (journal silent for 112 s), then the GNOME session
+  ended. **A GNOME logout stops the whole user manager** (`gnome-session-shutdown.target` -> `exit.target`), linger or
+  not, so t3code and every agent died and nothing restarted them until an SSH login. Fixes:
+  - `t3code-watchdog.timer` (system unit, every minute): starts `user@1000.service` and `t3code` if either is down.
+  - `~/.config/systemd/user/app-t3code-agents.slice.d/memory.conf`: all agents together get `MemoryHigh=21G`,
+    `MemoryMax=24G`, `MemorySwapMax=8G`, leaving room for GNOME, t3code and the system. systemd-oomd still kills
+    single agent scopes under pressure (user@1000 pressure limit 50%/20s).
+  - `lm-sensors` installed; `box status` shows CPU temp and swap. Under full agent load: ~82 °C, throttle at 100 °C.
 
 ## revnu2 path standardised (2026-10-02)
 
