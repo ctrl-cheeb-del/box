@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Keeps this machine's global copy of the skills revnu2 owns identical to revnu2's main, so
+# every agent here (Claude Code and Codex, in any repo) runs the same bot-loop. revnu2's
+# .agents/skills/<name> is the only place to edit them; this overwrites local changes.
+# Reads GitHub directly (no checkout needed: launchd jobs can't read ~/Documents on the Mac).
+# Runs hourly (systemd timer on the boxes, launchd on the Mac); `box sync-skills` runs it now everywhere.
+set -euo pipefail
+SRC_REPO=revnu-app/revnu2
+SKILLS=(bot-loop)
+
+for s in "${SKILLS[@]}"; do
+  dest="$HOME/.claude/skills/$s"
+  tmp=$(mktemp -d)
+  gh api "repos/$SRC_REPO/contents/.agents/skills/$s?ref=main" --jq '.[] | select(.type=="file") | .name' > "$tmp/.files"
+  [ -s "$tmp/.files" ] || { echo "$s: not on $SRC_REPO main, left alone"; rm -rf "$tmp"; continue; }
+  while read -r f; do
+    gh api -H "Accept: application/vnd.github.raw" "repos/$SRC_REPO/contents/.agents/skills/$s/$f?ref=main" > "$tmp/$f"
+    [[ $f == *.sh ]] && chmod +x "$tmp/$f"
+  done < "$tmp/.files"
+  rm "$tmp/.files"
+  chmod 755 "$tmp"
+  [ -f "$tmp/SKILL.md" ] || { echo "$s: download incomplete, left alone"; rm -rf "$tmp"; continue; }
+  if ! diff -r "$tmp" "$dest" >/dev/null 2>&1; then
+    mkdir -p "$HOME/.claude/skills"
+    rm -rf "$dest.old"; [ -e "$dest" ] && mv "$dest" "$dest.old"
+    mv "$tmp" "$dest"; rm -rf "$dest.old"
+    echo "$s: updated from $SRC_REPO main"
+  else
+    rm -rf "$tmp"
+  fi
+  chmod 755 "$dest"
+  # Codex reads ~/.codex/skills; point it at the same copy.
+  if [ -d "$HOME/.codex" ]; then
+    mkdir -p "$HOME/.codex/skills"
+    [ -L "$HOME/.codex/skills/$s" ] || rm -rf "$HOME/.codex/skills/$s"
+    ln -sfn "../../.claude/skills/$s" "$HOME/.codex/skills/$s"
+  fi
+  # macOS AppleDouble leftovers from an old copy
+  rm -f "$HOME/.claude/skills/._$s" "$HOME/.codex/skills/._$s"
+done

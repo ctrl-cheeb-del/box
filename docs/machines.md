@@ -54,6 +54,7 @@ box logs [unit]     follow t3code / cliproxyapi / gnome-remote-desktop logs
 box claude-login    add or re-auth a Claude account in the proxy
 box update          apt upgrade + t3/claude/codex/bun updates
 box sync-memory     two-way sync of revnu2 Claude memories (newer file wins)
+box sync-skills     global bot-loop skill = revnu2 main, on every machine (hourly timer too)
 box reboot          reboot, wait, show status
 ```
 
@@ -287,6 +288,10 @@ Documents one. Old folder kept in `~/old-memory-backup/` on skynet. Other repos 
 - 2026-10-03: Tailscale SSH turned off on jarvis (`tailscale set --ssh=false`); it demanded a browser check,
   so `box` couldn't reach jarvis away from home. Fixed by hopping through skynet (`ssh -J`).
 - 2026-10-03: heartbeat (ntfy, 30 min) on skynet + jarvis, `box usage`, 6-hourly memory sync on the Mac.
+- 2026-10-21: bot loops sat for hours "waiting" on finished CI and bots. Each machine had a different
+  `~/.claude/skills/bot-loop` (the Mac and jarvis had a stale one that never counted a clean bot pass, skynet had
+  none). Now `sync-skills` copies it from revnu2 main hourly on all three (`skills/`, README "Skills"), and
+  `~/.codex/skills/bot-loop` links to it. Deleted ~70 stray `._*` AppleDouble files from both boxes' skill folders.
 
 ## Hermes Agent (2026-10-04)
 

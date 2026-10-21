@@ -13,6 +13,7 @@ box logs [machine] [unit]     follow a user unit's journal (default t3code)
 box update [machine|all]      apt + t3/claude/codex/bun updates
 box reboot [machine]          reboot, wait, show status
 box sync-memory               two-way sync of revnu2 Claude memories with every machine
+box sync-skills               install bot-loop from revnu2 main on every machine (also hourly)
 box usage                     5-hour and weekly use per Claude account, and when each resets
 box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on the proxy machine)
 ```
@@ -29,7 +30,8 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `reapers/` | systemd user timers that stop forgotten dev stacks and orphaned Convex executors |
 | `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
 | `watch/` | babysits a few revnu creators every 3 hours and opens a T3 thread per problem (skynet) |
-| `mac/` | launchd job: `box sync-memory` every 6 hours (never starts Tailscale) |
+| `skills/` | `sync-skills`: the global `bot-loop` skill on every machine, copied from revnu2 main hourly |
+| `mac/` | launchd jobs: `box sync-memory` every 6 hours (never starts Tailscale), `sync-skills` hourly |
 
 Paths only, never secret values. Machine-local state (FreeRDP logs, `.rdp` files) stays in
 `~/.config/agentbox/`.
@@ -64,6 +66,15 @@ hostnames, one per line), then `systemctl --user enable --now box-heartbeat.time
 `~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u) <that file>`. Background jobs can't read
 `~/Documents`, so `box` keeps a copy of itself and `machines` in `~/.local/share/box`, refreshed each
 time you run it; the job runs that copy. Log: `/tmp/box-sync-memory.log`.
+
+## Skills
+
+revnu2's `.agents/skills/bot-loop` is the only copy of the bot-loop skill anyone edits. `skills/sync-skills`
+downloads it from revnu2 `main` with `gh api` into `~/.claude/skills/bot-loop` and links
+`~/.codex/skills/bot-loop` to it, so agents in any repo, Claude Code or Codex, on any machine, run the same
+version. It runs hourly: a systemd user timer on the boxes, `mac/com.box.sync-skills.plist` on the Mac.
+`box sync-skills` installs the script and its timer everywhere and runs it now. Local edits to the global
+copy are overwritten; change it in revnu2 and merge. Log on the Mac: `/tmp/box-sync-skills.log`.
 
 ## Watch
 

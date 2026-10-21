@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync global agent skills (bot-loop) from revnu2 main
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sync-skills

@@ -7,6 +7,8 @@ USER_NAME="art"
 PROXY_LOCAL_PORT=24874
 CONF_DIR="$HOME/.config/agentbox"
 MACHINES_FILE="${BOX_MACHINES:-${0:A:h}/../machines}"
+# This repo (skills/, mac/); absent when the launchd shadow copy runs.
+BOX_REPO=${0:A:h:h}
 # Background jobs (launchd) can't read ~/Documents, so keep a runnable copy outside it.
 SHADOW="$HOME/.local/share/box"
 if [[ ${0:A} == */bin/box && -r ${0:A:h}/../machines ]]; then
@@ -245,6 +247,32 @@ cmd_sync_memory() {
   say "memories synced with ${(j:, :)synced:-nothing} ($(ls "$mine" | grep -vc MEMORY.md) files)"
 }
 
+# Install skills/sync-skills (and its hourly timer) on every reachable machine and run it now,
+# so the global bot-loop everywhere is revnu2 main's.
+cmd_sync_skills() {
+  local n h d="$BOX_REPO/skills" ok=()
+  for n in $M_NAMES; do
+    TARGET=$n; h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
+    if [[ -r $d/sync-skills ]]; then
+      on "$h" 'mkdir -p ~/.local/bin && cat > ~/.local/bin/sync-skills && chmod +x ~/.local/bin/sync-skills' < "$d/sync-skills" || continue
+      if has_role $n mac; then
+        if [[ $h == self ]]; then
+          local plist=~/Library/LaunchAgents/com.box.sync-skills.plist
+          cmp -s "$BOX_REPO/mac/com.box.sync-skills.plist" $plist || {
+            cp "$BOX_REPO/mac/com.box.sync-skills.plist" $plist
+            launchctl bootout gui/$(id -u) $plist 2>/dev/null; launchctl bootstrap gui/$(id -u) $plist; }
+        fi
+      else
+        on "$h" 'mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/sync-skills.service' < "$d/sync-skills.service"
+        on "$h" 'cat > ~/.config/systemd/user/sync-skills.timer && systemctl --user daemon-reload && systemctl --user enable -q --now sync-skills.timer' < "$d/sync-skills.timer"
+      fi
+    fi
+    on "$h" '~/.local/bin/sync-skills' && ok+=($n)
+  done
+  TARGET=""
+  say "skills synced on ${(j:, :)ok:-nothing}"
+}
+
 cmd_update() {
   need_box update || return 1
   local h; h=$(resolve) || return 1
@@ -280,6 +308,7 @@ Commands ([machine] defaults to $(machine_with_role default); "all" means every 
   box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
   box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
   box sync-memory               two-way sync of revnu2 Claude memories with every machine
+  box sync-skills               install bot-loop from revnu2 main on every machine (also runs hourly)
   box usage                     5-hour and weekly use per Claude account
   box claude-login              add or re-auth a Claude account in the proxy (needs Art in a browser)
   box desktop [machine]         a box's Ubuntu desktop (Mac only)
@@ -314,6 +343,7 @@ case $cmd in
   usage|u) cmd_usage ;;
   update) each cmd_update ;;
   sync-memory) cmd_sync_memory ;;
+  sync-skills) cmd_sync_skills ;;
   reboot) cmd_reboot ;;
   help|-h|--help) cmd_help ;;
   *) say "unknown command: $cmd"; cmd_help; exit 1 ;;
