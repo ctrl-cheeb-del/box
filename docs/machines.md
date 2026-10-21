@@ -63,6 +63,12 @@ Aliases in `~/.zshrc`: `bx`, `bxd` (desktop), `bxs` (status), `bxp` (proxy).
 
 ## What runs on it
 
+Heavy Bun checks queue automatically on **skynet, jarvis, and the Mac** (2026-10-20).
+The machine-level launcher covers existing and new worktrees without package-file
+changes: two concurrent jobs per machine, with memory admission checks. Targeted
+tests and ordinary commands run normally. See [heavy-checks.md](heavy-checks.md)
+for commands, configuration, and rollback. Already-running commands are unaffected.
+
 All are systemd **user** services with linger on, so they start at boot with nobody logged in.
 
 | Service | Unit | Notes |

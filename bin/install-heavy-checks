@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Make the heavy-check queue the default Bun launcher on this machine."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import tempfile
+
+MARKER = "# box-heavy-check-launcher-v1"
+
+
+def atomic_copy(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".heavy-check-", dir=target.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, temp)
+        os.chmod(temp, 0o755)
+        os.replace(temp, target)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def install(home, bun, uninstall=False):
+    manifest = home / ".local/share/box/heavy-check-install.json"
+    if uninstall:
+        data = json.loads(manifest.read_text())
+        bun, original = Path(data["bun"]), Path(data["original"])
+        if MARKER.encode() not in bun.read_bytes()[:256]:
+            raise ValueError("Bun launcher has changed; refusing to overwrite it")
+        atomic_copy(original, bun)
+        manifest.unlink()
+        print(f"Restored original Bun at {bun}")
+        return
+    bun = bun.absolute()
+    if bun.is_symlink():
+        raise ValueError("pass the actual Bun executable, not a symlink")
+    with bun.open("rb") as file:
+        prefix = file.read(256)
+    original = bun.with_name(bun.name + ".heavy-check-original")
+    if MARKER.encode() in prefix:
+        if not original.is_file():
+            raise ValueError(f"missing original Bun: {original}")
+    else:
+        if not (prefix.startswith(b"\x7fELF") or prefix[:4] in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe")):
+            raise ValueError("expected a native Bun binary; refusing to wrap another script")
+        atomic_copy(bun, original)
+    runner = home / ".local/bin/heavy-check"
+    atomic_copy(Path(__file__).resolve().with_name("heavy-check"), runner)
+    launcher = ("#!/bin/sh\n" + MARKER + "\n"
+                'if [ "${0##*/}" = bunx ]; then set -- x "$@"; fi\n'
+                f'exec {shlex.quote(str(runner))} bun -- {shlex.quote(str(original))} "$@"\n')
+    fd, temp = tempfile.mkstemp(prefix=".heavy-check-", dir=bun.parent)
+    try:
+        with os.fdopen(fd, "w") as file:
+            file.write(launcher)
+        os.chmod(temp, 0o755)
+        os.replace(temp, bun)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"bun": str(bun), "original": str(original)}, indent=2) + "\n")
+    print(f"Automatic heavy-check queue enabled: {bun}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--bun", type=Path)
+    parser.add_argument("--uninstall", action="store_true")
+    args = parser.parse_args()
+    install(args.home, args.bun or args.home / ".bun/bin/bun", args.uninstall)

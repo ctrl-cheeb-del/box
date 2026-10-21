@@ -2,3 +2,4 @@
 *.rdp
 *.bak*
 .DS_Store
+__pycache__/

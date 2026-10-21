@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Small, per-user queue for memory-heavy commands. No daemon or dependencies."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+import re
+
+ROOT = Path(os.environ.get("HEAVY_CHECK_STATE", Path.home() / ".local/state/box/heavy-check"))
+CONFIG = Path(os.environ.get("HEAVY_CHECK_CONFIG", Path.home() / ".config/box/heavy-check.json"))
+DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4}
+STOP = False
+BOOT = None
+
+
+def settings():
+    config = DEFAULTS | (json.loads(CONFIG.read_text()) if CONFIG.exists() else {})
+    if not isinstance(config["slots"], int) or not 1 <= config["slots"] <= 32:
+        raise ValueError("slots must be an integer from 1 to 32")
+    for key in ("reserve_gib", "headroom_gib"):
+        if not isinstance(config[key], (int, float)) or config[key] < 0:
+            raise ValueError(f"{key} must be a nonnegative number")
+    return config
+
+
+def available_gib():
+    if sys.platform == "darwin":
+        pressure = subprocess.check_output(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], text=True).strip()
+        if pressure != "1":
+            return 0
+        stats = subprocess.check_output(["vm_stat"], text=True)
+        page_size = int(re.search(r"page size of (\d+) bytes", stats).group(1))
+        pages = sum(int(re.search(rf"{label}:\s+(\d+)", stats).group(1))
+                    for label in ("Pages free", "Pages inactive", "Pages speculative"))
+        return pages * page_size / 1073741824
+    if sys.platform != "linux":
+        raise RuntimeError("heavy-check supports Linux and macOS")
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1048576
+    raise RuntimeError("MemAvailable missing from /proc/meminfo")
+
+
+def identity(pid):
+    """Include boot ID and process start time so recycled PIDs are not owners."""
+    global BOOT
+    if sys.platform == "darwin":
+        if BOOT is None:
+            BOOT = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True).strip()
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="],
+                                text=True, capture_output=True, timeout=5)
+        fields = result.stdout.strip().split(None, 1)
+        if result.returncode or len(fields) != 2 or fields[0].startswith("Z"):
+            return None
+        return BOOT + ":" + fields[1]
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if fields[0] == "Z":
+            return None
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + fields[19]
+    except (OSError, IndexError):
+        return None
+
+
+@contextlib.contextmanager
+def database():
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    db = sqlite3.connect(ROOT / "queue.sqlite", timeout=30, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
+    db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY, created REAL, cwd TEXT, command TEXT,
+        state TEXT, owner INTEGER, identity TEXT, pgid INTEGER,
+        child_identity TEXT, started REAL, finished REAL, code INTEGER,
+        cancel INTEGER DEFAULT 0)""")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield db
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+
+
+def reap(db):
+    for job in db.execute("SELECT * FROM jobs WHERE state IN ('queued','running')").fetchall():
+        if identity(job["owner"]) == job["identity"]:
+            continue
+        # If the supervisor was SIGKILLed, kill its still-identifiable child group.
+        # The child inherits the slot lock, so a surviving command never frees capacity.
+        if job["pgid"] and identity(job["pgid"]) == job["child_identity"]:
+            signal_group(job["pgid"], signal.SIGKILL)
+        db.execute("UPDATE jobs SET state='lost',finished=?,code=125 WHERE id=?", (time.time(), job["id"]))
+
+
+def nested():
+    job_id = os.environ.get("HEAVY_CHECK_JOB")
+    if not job_id:
+        return False
+    with database() as db:
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return bool(job and job["state"] == "running" and job["pgid"] == os.getpgrp())
+
+
+VALUE_FLAGS = {"--cwd", "-C", "--filter", "--env-file", "--config", "-c", "--preload", "-r",
+               "--timeout", "--test-name-pattern", "-t", "--reporter", "--reporter-outfile",
+               "--coverage-reporter", "--coverage-dir", "--concurrent", "--max-concurrency"}
+
+
+def positional(args):
+    result = []
+    iterator = iter(args)
+    for arg in iterator:
+        if arg == "--":
+            result.extend(iterator)
+            break
+        if arg in VALUE_FLAGS:
+            next(iterator, None)
+        elif not arg.startswith("-"):
+            result.append(arg)
+    return result
+
+
+def heavy_bun(args):
+    """Recognize full checks without requiring each checkout to carry wrappers."""
+    if any(arg in ("--help", "-h", "--version", "-v") for arg in args):
+        return False
+    words = positional(args)
+    if not words:
+        return False
+    command = words[0]
+    if command == "run":
+        return len(words) > 1 and words[1].split(":", 1)[0] in {"check", "typecheck", "build", "test"}
+    if command == "test":
+        # A named file or test-name filter is a targeted test; let it run freely.
+        return len(words) == 1 and not any(arg == "-t" or arg.startswith("--test-name-pattern") for arg in args)
+    if command == "x":
+        return len(words) > 1 and words[1].split("@", 1)[0] == "tsc"
+    return command.split(":", 1)[0] in {"check", "typecheck", "build", "test"}
+
+
+def stop(signum, frame):
+    global STOP
+    STOP = True
+
+
+def signal_group(pgid, signum):
+    try:
+        os.killpg(pgid, signum)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can report EPERM, rather than ESRCH, for an exiting zombie group.
+        # Do not suppress permission failures if the group still has live members.
+        if sys.platform == "darwin":
+            rows = subprocess.check_output(["ps", "-axo", "pgid=,stat="], text=True)
+            members = [line.split() for line in rows.splitlines()]
+            if not any(int(row[0]) == pgid and not row[1].startswith("Z") for row in members if len(row) == 2):
+                return False
+        raise
+
+
+def group_exists(pgid):
+    return signal_group(pgid, 0)
+
+
+def terminate(child):
+    if not signal_group(child.pid, signal.SIGTERM):
+        return
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        child.poll()
+        if not group_exists(child.pid):
+            break
+        time.sleep(0.05)
+    signal_group(child.pid, signal.SIGKILL)
+    child.wait()
+
+
+def work(job_id):
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    child = None
+    slot = None
+    state, code = "failed", 125
+    try:
+        last_notice = 0
+        while child is None:
+            config = settings()
+            with database() as db:
+                reap(db)
+                job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if STOP or job["cancel"]:
+                    state, code = "cancelled", 130
+                    break
+                first = db.execute("""SELECT q.id FROM jobs q WHERE q.state='queued'
+                    AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.state='running' AND r.cwd=q.cwd)
+                    ORDER BY q.created,q.id LIMIT 1""").fetchone()
+                # Account for a newly admitted job before its RSS has grown.
+                young = db.execute("SELECT COUNT(*) FROM jobs WHERE state='running' AND started>?", (time.time() - 10,)).fetchone()[0]
+                enough = available_gib() >= config["headroom_gib"] + config["reserve_gib"] * (1 + young)
+                same_checkout = db.execute("SELECT 1 FROM jobs WHERE state='running' AND cwd=?", (job["cwd"],)).fetchone()
+                if first and first["id"] == job_id and enough and not same_checkout:
+                    for number in range(config["slots"]):
+                        candidate = open(ROOT / f"slot-{number}.lock", "a+")
+                        try:
+                            fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            slot = candidate
+                            break
+                        except BlockingIOError:
+                            candidate.close()
+                    if slot is not None:
+                        env = os.environ | {"HEAVY_CHECK_JOB": job_id, "HEAVY_CHECK_STATE": str(ROOT)}
+                        child = subprocess.Popen(json.loads(job["command"]), cwd=job["cwd"], env=env,
+                                                 start_new_session=True, pass_fds=(slot.fileno(),))
+                        db.execute("UPDATE jobs SET state='running',pgid=?,child_identity=?,started=? WHERE id=?",
+                                   (child.pid, identity(child.pid), time.time(), job_id))
+                if child is None and time.monotonic() - last_notice > 30:
+                    print(f"[heavy-check {job_id}] queued; waiting for a slot and memory", file=sys.stderr, flush=True)
+                    last_notice = time.monotonic()
+            if child is None:
+                time.sleep(0.25)
+        if child is not None:
+            print(f"[heavy-check {job_id}] running", file=sys.stderr, flush=True)
+            while True:
+                with database() as db:
+                    cancelled = db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+                if STOP or cancelled:
+                    terminate(child)
+                    state, code = "cancelled", 130
+                    break
+                result = child.poll()
+                if result is not None:
+                    # Commands must not leave background children occupying memory.
+                    terminate(child)
+                    code = result if result >= 0 else 128 - result
+                    state = "done" if code == 0 else "failed"
+                    break
+                time.sleep(0.25)
+    finally:
+        if child is not None and child.poll() is None:
+            terminate(child)
+        with database() as db:
+            db.execute("UPDATE jobs SET state=?,code=?,finished=? WHERE id=?", (state, code, time.time(), job_id))
+        if slot is not None:
+            slot.close()
+    print(f"[heavy-check {job_id}] {state} (exit {code})", file=sys.stderr, flush=True)
+    return code
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["run", "submit", "status", "logs", "cancel", "_work", "bun"])
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.action == "bun":
+        command = args.args[1:] if args.args[:1] == ["--"] else args.args
+        if not command:
+            parser.error("bun dispatcher requires the original executable")
+        if not heavy_bun(command[1:]):
+            os.execv(command[0], command)
+        args.action, args.args = "run", command
+    settings()
+    if args.action == "_work":
+        return work(args.args[0])
+    if args.action in ("run", "submit"):
+        command = args.args[1:] if args.args[:1] == ["--"] else args.args
+        if not command:
+            parser.error("supply a command after --")
+        if args.action == "run" and nested():
+            os.execvpe(command[0], command, os.environ)
+        job_id = uuid.uuid4().hex[:12]
+        with database() as db:
+            reap(db)
+            db.execute("INSERT INTO jobs (id,created,cwd,command,state,owner,identity) VALUES (?,?,?,?,?,?,?)",
+                       (job_id, time.time(), os.getcwd(), json.dumps(command), "queued", os.getpid(), identity(os.getpid())))
+            if args.action == "submit":
+                with open(ROOT / f"{job_id}.log", "ab", buffering=0) as log:
+                    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_work", job_id],
+                                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                db.execute("UPDATE jobs SET owner=?,identity=? WHERE id=?", (child.pid, identity(child.pid), job_id))
+        if args.action == "submit":
+            print(job_id)
+            return 0
+        print(f"[heavy-check {job_id}] submitted", file=sys.stderr, flush=True)
+        return work(job_id)
+    with database() as db:
+        reap(db)
+        if args.action == "status":
+            jobs = [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 50")]
+            if args.args == ["--json"]:
+                print(json.dumps(jobs))
+            else:
+                print("ID            STATE       EXIT  COMMAND / DIRECTORY")
+                for job in jobs:
+                    print(f"{job['id']}  {job['state']:<10}  {str(job['code']):<4}  {json.loads(job['command'])!r} / {job['cwd']}")
+            return 0
+        if len(args.args) != 1:
+            parser.error("supply one job ID")
+        job_id = args.args[0]
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            parser.error("unknown job ID")
+        if args.action == "cancel":
+            db.execute("UPDATE jobs SET cancel=1 WHERE id=?", (job_id,))
+            print(f"Cancellation requested for {job_id}")
+            return 0
+    log = ROOT / f"{job_id}.log"
+    if not log.exists():
+        parser.error("foreground jobs stream output to their caller; only submitted jobs have logs")
+    sys.stdout.write(log.read_text(errors="replace"))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"heavy-check: {error}", file=sys.stderr)
+        sys.exit(125)

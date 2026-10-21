@@ -277,7 +277,7 @@ cmd_sync_skills() {
 cmd_update() {
   need_box update || return 1
   local h; h=$(resolve) || return 1
-  ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade" && systemctl --user restart t3code'
+  ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade; if [ -x \"\$HOME/.local/bin/install-heavy-checks\" ]; then \"\$HOME/.local/bin/install-heavy-checks\"; fi" && systemctl --user restart t3code'
 }
 
 # What each machine is for, shown in `box help`.

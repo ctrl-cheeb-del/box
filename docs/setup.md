@@ -268,6 +268,12 @@ over too, and kept in sync with rsync.
 
 ## 9. Keep it healthy
 
+Install the default heavy-check queue on each machine (Linux and macOS):
+`python3 bin/install-heavy-checks` from this repo. It wraps the existing Bun
+launcher, so full checks, typechecks, builds, and test suites share two slots
+across all projects and worktrees. Targeted tests and ordinary commands run
+normally. See [heavy-checks.md](heavy-checks.md) for configuration and rollback.
+
 A box never reboots, so leaks that a laptop clears by sleeping pile up. On 2026-10-02 forgotten
 `bun dev` stacks (3-5 GB each) filled skynet's memory and T3 stopped answering. Three guards:
 
