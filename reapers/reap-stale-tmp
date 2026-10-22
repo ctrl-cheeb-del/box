@@ -107,9 +107,13 @@ def old_tree(path, uid, device, cutoff, mounts=()):
         return None
 
 
+SHOWN = 20
+
+
 def main(argv=None, root=Path("/tmp")):
     parser = argparse.ArgumentParser(description=__doc__ or "Reap unused /tmp trees older than two days.")
     parser.add_argument("--dry-run", action="store_true", help="list candidates without deleting anything")
+    parser.add_argument("--list", action="store_true", help=f"print every entry, not just the {SHOWN} largest")
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux") or not hasattr(os, "O_NOATIME"):
         parser.error("Linux /proc and O_NOATIME are required")
@@ -143,7 +147,10 @@ def main(argv=None, root=Path("/tmp")):
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             print("cannot check open files/cwd; removed nothing: " + str(exc), file=sys.stderr)
             return 1
+        # The first run on a full /tmp removes tens of thousands of entries; one line each overran
+        # journald's rate limit and dropped the summary. Print the largest few unless --list.
         removed, freed, busy, changed, failed = 0, 0, 0, 0, 0
+        done = []
         for path, tree in candidates:
             nodes, allocated = tree
             if nodes.keys() & refs:
@@ -161,12 +168,20 @@ def main(argv=None, root=Path("/tmp")):
                         path.unlink()
                 except OSError as exc:
                     failed += 1
-                    print("failed to remove " + repr(str(path)) + ": " + str(exc), file=sys.stderr)
+                    if args.list or failed <= SHOWN:
+                        print("failed to remove " + repr(str(path)) + ": " + str(exc), file=sys.stderr)
                     continue
             removed += 1
             freed += allocated
-            action = "would remove" if args.dry_run else "removed"
-            print(f"{action} {str(path)!r} ({allocated} allocated bytes)", flush=True)
+            done.append((allocated, path))
+        action = "would remove" if args.dry_run else "removed"
+        shown = sorted(done, key=lambda item: item[0], reverse=True)
+        for allocated, path in shown if args.list else shown[:SHOWN]:
+            print(f"{action} {str(path)!r} ({allocated} allocated bytes)")
+        if len(done) > SHOWN and not args.list:
+            print(f"... and {len(done) - SHOWN} smaller entries (--list shows all)")
+        if failed > SHOWN and not args.list:
+            print(f"... and {failed - SHOWN} more failures (--list shows all)", file=sys.stderr)
         action = "would free" if args.dry_run else "freed"
         print(f"{'dry-run: ' if args.dry_run else ''}{removed} entries; {action} ~{freed} bytes "
               f"({freed / 1024**2:.1f} MiB); kept {busy} busy, {changed} changed during scan; {failed} failed")
