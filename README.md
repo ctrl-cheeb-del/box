@@ -7,11 +7,12 @@ setup guide, and the scripts that keep them healthy.
 box list                      machines and whether they're reachable now
 box [machine]                 shell (tmux "main"); default machine: skynet
 box desktop [machine]         Ubuntu desktop over FreeRDP
-box status [machine|all]      services, Claude, battery, T3 Connect, disk
+box status [machine|all]      services, Claude, browser sandbox, battery, disk
 box run [machine] <cmd>       one command
 box logs [machine] [unit]     follow a user unit's journal (default t3code)
 box update [machine|all]      apt + t3/claude/codex/bun updates
 box reboot [machine]          reboot, wait, show status
+box threads search <query>    search T3 threads on every reachable machine
 box sync-memory               two-way sync of revnu2 Claude memories with every machine
 box sync-skills               install bot-loop from revnu2 main on every machine (also hourly)
 box usage                     5-hour and weekly use per Claude account, and when each resets
@@ -27,7 +28,7 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `docs/setup.md` | building a box from scratch, every trap included, plus a prompt to hand the job to an agent |
 | `docs/add-a-device.md` | adding a laptop, phone or another box to this setup (copy-paste prompt inside) |
 | `docs/machines.md` | the running record: what's on each machine, where credentials live, past incidents |
-| `reapers/` | systemd user timers that stop forgotten dev stacks and orphaned Convex executors |
+| `reapers/` | systemd user timers for forgotten dev stacks, orphaned executors and stale /tmp trees |
 | `bin/heavy-check`, `bin/install-heavy-checks` | automatic Linux/macOS queue for heavy Bun checks; [install and usage](docs/heavy-checks.md) |
 | `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
 | `watch/` | babysits a few revnu creators every 3 hours and opens a T3 thread per problem (skynet) |
