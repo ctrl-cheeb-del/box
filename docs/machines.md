@@ -53,6 +53,7 @@ box run <cmd>       one command on the box, e.g. box run 'df -h'
 box logs [unit]     follow t3code / cliproxyapi / gnome-remote-desktop logs
 box claude-login    add or re-auth a Claude account in the proxy
 box update          apt upgrade + t3/claude/codex/bun updates
+box threads search <query>  T3 titles/messages and linked Claude transcripts on every reachable machine
 box sync-memory     two-way sync of revnu2 Claude memories (newer file wins)
 box sync-skills     global bot-loop skill = revnu2 main, on every machine (hourly timer too)
 box reboot          reboot, wait, show status
@@ -226,13 +227,34 @@ Prevention: user timer `reap-convex-executors.timer` (every 10 min) runs `~/.loc
 which kills executors whose parent is no longer a `convex-local-backend` and deletes their temp dir.
 Check: `systemctl --user list-timers reap-convex-executors.timer`; `journalctl --user -u reap-convex-executors`.
 
-## /tmp age-out (2026-09-29)
+## /tmp age-out
 
-`/tmp` is RAM-backed, and agents fill it with Chrome automation profiles, video renders and scratch dirs.
-`/etc/tmpfiles.d/tmp.conf` overrides Ubuntu's 10-day default: anything in `/tmp` untouched for 3 days is removed
-by the daily `systemd-tmpfiles-clean.timer`. Excluded because they live as long as a dev stack or session:
-`/tmp/.tmp*` (Convex executors), `/tmp/revnu-wt-tar-*`, `/tmp/tmux-*`, `/tmp/codex-*`. Run by hand with
-`sudo systemd-tmpfiles --clean`. Repo-side leaks fixed in #1914 (Convex executors) and #1915 (worktree tarballs).
+`/tmp` is RAM-backed. The old `/etc/tmpfiles.d/tmp.conf` three-day cleanup did not keep up: jarvis
+reached 160k top-level entries and ran out of space (REV-1240). `reap-stale-tmp.timer` in `reapers/`
+runs hourly, deleting our unused top-level entries only when the whole tree has both mtime and atime
+at least two days old and no live process holds an open file or cwd there. Foreign-owned descendants,
+sockets, symlinks, mounts and tmux/ssh/systemd/X11/.ICE directories keep the entire entry safe.
+Install with the other user reapers ([setup](setup.md#9-keep-it-healthy)); preview with
+`reap-stale-tmp --dry-run`, logs with `journalctl --user -u reap-stale-tmp`. Incomplete process visibility
+aborts cleanup; passwordless sudo is used only for the read-only `/proc` scan, never deletion.
+
+## Finding a thread across machines
+
+`box threads search boat.dev` searches every reachable machine, including this one. Results show
+machine, T3 thread ID, title and a matching snippet (one row per thread). Queries are literal,
+case-insensitive substrings; quote multi-word queries. Unreachable machines are reported and skipped.
+It reads `~/.t3/userdata/statev2.sqlite` (`T3CODE_HOME` overrides `~/.t3`) through Python's sqlite3 module
+in read-only URI mode, including legacy and current thread/message projections. Linked Claude
+transcripts under `~/.claude/projects` supply matches in tool output absent from T3 messages. It also
+searches archived threads, skips deleted threads and never changes T3 state.
+
+## T3 preview AppArmor setup
+
+Ubuntu's user-namespace restriction requires T3's own `t3-chrome-headless-shell` profile, separate
+from the Playwright profile. `box status` flags missing setup and prints the host command:
+`sudo env "PATH=$PATH" t3 browser setup`. See [setup](setup.md#7-t3-code-server-and-t3-connect).
+Verified 2026-10-22: skynet already had the profile; jarvis setup completed with passwordless `sudo -n`.
+Both now report the profile installed in `box status all`.
 
 ## T3 service won't start after `t3 update` (2026-09-29)
 

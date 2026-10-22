@@ -179,6 +179,17 @@ t3 service install                       # systemd user service, starts at boot
 t3 connect link --headless               # device code: approve with your T3 account
 systemctl --user restart t3code          # repeat until `t3 connect status` says "provisioned"
 ```
+**Set up T3's browser sandbox on the host**, once after installing T3:
+```bash
+sudo env "PATH=$PATH" t3 browser setup
+```
+Ubuntu 23.10+ AppArmor blocks the sandbox without this step (`preview_open`: "This host blocks the
+sandbox T3's browser runs in (AppArmor on Ubuntu 23.10+)"). The command installs T3's targeted
+`t3-chrome-headless-shell` AppArmor profile and required browser libraries; the Playwright profile
+in section 8 does not cover T3. `box status` flags a missing, disabled or unloaded profile and prints
+the fix. Agents should use `sudo -n env "PATH=$PATH" t3 browser setup`; if it needs a password or
+isn't quick, leave the command for the owner to run on that host.
+
 After linking, `t3 connect status` often says "pending server startup"; restart the service again
 (it took two restarts on both of Art's boxes). If it never provisions, read
 `~/.t3/userdata/logs/boot-service.log`: **the free T3 Connect tier allows 3 tunnels per account**
@@ -209,7 +220,7 @@ box stack with `bun dev-login`; OAuth redirects back to your laptop's `localhost
 Restarting `t3code.service` (or rebooting) kills every agent thread running on the box ("Provider session
 did not survive a server restart"); the files survive, send each thread a message to continue.
 
-**Renaming a box** keeps its threads (they live in `~/.t3/userdata/state.sqlite`, keyed by
+**Renaming a box** keeps its threads (they live in `~/.t3/userdata/statev2.sqlite`, keyed by
 `~/.t3/userdata/environment-id`, not the hostname), but T3 Connect caches the old name. Rename with
 `sudo hostnamectl set-hostname <new>` (and the `127.0.1.1` line in `/etc/hosts`,
 `sudo systemctl restart avahi-daemon`, `sudo tailscale set --hostname=<new>`), then
@@ -277,20 +288,28 @@ normally. See [heavy-checks.md](heavy-checks.md) for configuration and rollback.
 A box never reboots, so leaks that a laptop clears by sleeping pile up. On 2026-10-02 forgotten
 `bun dev` stacks (3-5 GB each) filled skynet's memory and T3 stopped answering. Three guards:
 
-- **Reaper timers.** Copy the files in [`reapers/`](../reapers/): the two scripts to `~/.local/bin/`
-  (`chmod +x`), the four units to `~/.config/systemd/user/`, then
-  `systemctl --user daemon-reload && systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer`.
+- **Reaper timers.** Copy the files in [`reapers/`](../reapers/): the three scripts to `~/.local/bin/`
+  (`chmod +x`), the six units to `~/.config/systemd/user/`, then
+  `systemctl --user daemon-reload && systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer reap-stale-tmp.timer`.
   `reap-idle-dev-stacks` stops a stack with no activity for 8 hours and writes a `[reaper]` line to its
   `dev.log`; try `reap-idle-dev-stacks --dry-run`. `reap-convex-executors` kills Convex local-backend
-  executors orphaned by a stopped backend.
+  executors orphaned by a stopped backend. `reap-stale-tmp` runs hourly and removes top-level `/tmp`
+  entries only when every file and directory has both mtime and atime at least two days old and no
+  live process has a cwd or open file in the tree. It skips other users' entries (including descendants),
+  sockets, symlinks, special files, mounts and tmux/ssh/systemd/X11/.ICE directories. Directory scans use
+  `O_NOATIME`, so a dry-run does not reset the age. It rechecks each tree before removal and logs paths
+  and approximate allocated bytes freed to `journalctl --user -u reap-stale-tmp`. Try
+  `~/.local/bin/reap-stale-tmp --dry-run` first, as your regular user. Needs Python 3; when `/proc` hides
+  another user's handles it uses passwordless `sudo -n` only for a read-only process scan. If any process
+  cannot be inspected it removes nothing. Deletion always runs as your user.
 - **zram** (compressed swap, used before the disk):
   `sudo apt install -y systemd-zram-generator`, then `/etc/systemd/zram-generator.conf` with
   `[zram0]`, `zram-size = ram / 2`, `compression-algorithm = zstd`, `swap-priority = 100`;
   `/etc/sysctl.d/99-zram.conf` with `vm.swappiness = 180` and `vm.page-cluster = 0`; then
   `sudo sysctl --system && sudo systemctl daemon-reload && sudo systemctl restart systemd-zram-setup@zram0`.
-- **/tmp age-out.** `/tmp` is RAM-backed. An `/etc/tmpfiles.d/tmp.conf` with `Q /tmp 1777 root root 3d`
-  plus `x` lines excluding `/tmp/.tmp*`, `/tmp/revnu-wt-tar-*`, `/tmp/tmux-*` and `/tmp/codex-*` clears
-  anything untouched for 3 days.
+- **/tmp capacity.** `/tmp` is RAM-backed. Check `df -h /tmp` as well as the root disk. The hourly
+  `reap-stale-tmp.timer` above ages out unused trees; the old three-day tmpfiles override alone did
+  not keep up with agent scratch files.
 
 If `t3 update` leaves the service crash-looping with "Service state is invalid or unsupported", move
 `~/.t3/runtime/.service-stopping` aside, then `systemctl --user reset-failed t3code && systemctl --user start t3code`.
@@ -348,7 +367,7 @@ Anthropic workspace and don't leave them running (revnu2 `docs/knowledge/anthrop
 ```bash
 systemctl --user is-active t3code gnome-remote-desktop; systemctl is-active tailscaled
 t3 connect status | grep -E "link|Relay"      # "provisioned"
-systemctl --user list-timers | grep reap       # both reapers scheduled
+systemctl --user list-timers | grep reap       # all three reapers scheduled
 zramctl                                        # zram0 present
 sudo systemctl suspend      # should fail with "Access denied": sleep is masked
 ```

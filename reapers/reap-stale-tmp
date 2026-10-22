@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# Reap our /tmp entries untouched for two days, unless a process still uses them.
+# Usage: reap-stale-tmp [--dry-run]. Linux only; never follows symlinks or crosses mounts.
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+# Run just this read-only /proc scan with sudo -n if procfs hides another user's handles.
+# Never elevate the deletion code. A failed/incomplete scan means nothing is removed.
+PROC_SCAN = r'''
+import errno, json, os
+refs, denied = set(), []
+for pid in os.listdir('/proc'):
+    if not pid.isdigit():
+        continue
+    base = '/proc/' + pid
+    try:
+        handles = [base + '/cwd']
+        handles += [base + '/fd/' + fd for fd in os.listdir(base + '/fd')]
+        for handle in handles:
+            try:
+                s = os.stat(handle)
+                refs.add((s.st_dev, s.st_ino))
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ESRCH):
+                    raise
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ESRCH):
+            denied.append(pid)
+print(json.dumps({'refs': sorted(refs), 'denied': denied}))
+'''
+
+
+def open_refs():
+    command = [sys.executable, "-c", PROC_SCAN]
+    result = json.loads(subprocess.check_output(command, text=True, timeout=30))
+    if result["denied"]:
+        result = json.loads(subprocess.check_output(["sudo", "-n"] + command, text=True, timeout=30))
+    if result["denied"]:
+        raise RuntimeError("cannot inspect live processes: " + ", ".join(result["denied"]))
+    return {tuple(ref) for ref in result["refs"]}
+
+
+def protected(name):
+    return name.startswith(("tmux", "ssh-", ".ssh", "systemd", ".systemd", "X11", ".X11", ".ICE"))
+
+
+def mounted_paths(root):
+    # st_dev alone misses bind mounts on the same filesystem.
+    mounts = set()
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        name = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+        mount = Path(name)
+        if mount == root or root in mount.parents:
+            mounts.add(mount)
+    return mounts
+
+
+def old_tree(path, uid, device, cutoff, mounts=()):
+    """Return inode identities and allocated bytes, or None for anything unsafe/recent.
+
+    O_NOATIME matters: walking a directory must not make it look recently used at the next
+    run (or the final safety check). O_NOFOLLOW and dir_fd keep traversal inside this tree.
+    """
+    if any(path == mount or path in mount.parents for mount in mounts):
+        return None
+    nodes, allocated = {}, 0
+
+    def visit(parent_fd, name):
+        nonlocal allocated
+        s = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (s.st_uid != uid or s.st_dev != device or max(s.st_mtime, s.st_atime) > cutoff or
+                not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode))):
+            raise ValueError("protected, foreign, special or recent entry")
+        key = (s.st_dev, s.st_ino)
+        nodes[key] = (s.st_mtime_ns, s.st_ctime_ns, s.st_size, s.st_nlink)
+        # Hard-linked files may retain their storage elsewhere after unlinking.
+        if stat.S_ISDIR(s.st_mode) or s.st_nlink == 1:
+            allocated += s.st_blocks * 512
+        if stat.S_ISDIR(s.st_mode):
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME,
+                         dir_fd=parent_fd)
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino) != key:
+                    raise ValueError("directory changed during scan")
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        if protected(entry.name):
+                            raise ValueError("protected directory")
+                        visit(fd, entry.name)
+            finally:
+                os.close(fd)
+
+    try:
+        visit(None, str(path))
+        return nodes, allocated
+    except (OSError, ValueError):
+        return None
+
+
+def main(argv=None, root=Path("/tmp")):
+    parser = argparse.ArgumentParser(description=__doc__ or "Reap unused /tmp trees older than two days.")
+    parser.add_argument("--dry-run", action="store_true", help="list candidates without deleting anything")
+    args = parser.parse_args(argv)
+    if not sys.platform.startswith("linux") or not hasattr(os, "O_NOATIME"):
+        parser.error("Linux /proc and O_NOATIME are required")
+    if os.geteuid() == 0:
+        parser.error("run as the user whose /tmp entries should be cleaned, without sudo")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        parser.error("this Python cannot safely remove directory trees")
+
+    uid = os.getuid()
+    lockdir = Path(os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache")))
+    lockdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (lockdir / "reap-stale-tmp.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another reap-stale-tmp is running, skipped")
+            return 0
+        cutoff = time.time() - 2 * 86400
+        device = root.stat().st_dev
+        mounts = mounted_paths(root)
+        candidates = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if protected(entry.name):
+                    continue
+                tree = old_tree(Path(entry.path), uid, device, cutoff, mounts)
+                if tree is not None:
+                    candidates.append((Path(entry.path), tree))
+        try:
+            refs = open_refs() if candidates else set()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            print("cannot check open files/cwd; removed nothing: " + str(exc), file=sys.stderr)
+            return 1
+        removed, freed, busy, changed, failed = 0, 0, 0, 0, 0
+        for path, tree in candidates:
+            nodes, allocated = tree
+            if nodes.keys() & refs:
+                busy += 1
+                continue
+            # Recheck ownership, tree identity and activity immediately before deletion.
+            if old_tree(path, uid, device, cutoff, mounts) != tree:
+                changed += 1
+                continue
+            if not args.dry_run:
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                except OSError as exc:
+                    failed += 1
+                    print("failed to remove " + repr(str(path)) + ": " + str(exc), file=sys.stderr)
+                    continue
+            removed += 1
+            freed += allocated
+            action = "would remove" if args.dry_run else "removed"
+            print(f"{action} {str(path)!r} ({allocated} allocated bytes)", flush=True)
+        action = "would free" if args.dry_run else "freed"
+        print(f"{'dry-run: ' if args.dry_run else ''}{removed} entries; {action} ~{freed} bytes "
+              f"({freed / 1024**2:.1f} MiB); kept {busy} busy, {changed} changed during scan; {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap stale /tmp entries every hour
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
