@@ -297,8 +297,8 @@ A box never reboots, so leaks that a laptop clears by sleeping pile up. On 2026-
   entries only when every file and directory has both mtime and atime at least two days old and no
   live process has a cwd or open file in the tree. It skips other users' entries (including descendants),
   sockets, symlinks, special files, mounts and tmux/ssh/systemd/X11/.ICE directories. Directory scans use
-  `O_NOATIME`, so a dry-run does not reset the age. It rechecks each tree before removal and logs paths
-  and approximate allocated bytes freed to `journalctl --user -u reap-stale-tmp`. Try
+  `O_NOATIME`, so a dry-run does not reset the age. It rechecks each tree before removal and logs the 20
+  largest entries and a summary of bytes freed to `journalctl --user -u reap-stale-tmp` (`--list` prints every entry). Try
   `~/.local/bin/reap-stale-tmp --dry-run` first, as your regular user. Needs Python 3; when `/proc` hides
   another user's handles it uses passwordless `sudo -n` only for a read-only process scan. If any process
   cannot be inspected it removes nothing. Deletion always runs as your user.

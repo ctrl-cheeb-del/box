@@ -50,12 +50,28 @@ class ReaperTest(unittest.TestCase):
         return reaper.old_tree(path, self.uid if uid is None else uid,
                                self.dev if dev is None else dev, self.cutoff)
 
-    def run_reaper(self, dry=False, refs=None):
+    def run_reaper(self, dry=False, refs=None, extra=()):
         output = io.StringIO()
         with patch.object(reaper, "open_refs", return_value=refs or set()), contextlib.redirect_stdout(output):
-            code = reaper.main(["--dry-run"] if dry else [], root=self.root)
+            code = reaper.main((["--dry-run"] if dry else []) + list(extra), root=self.root)
         self.assertEqual(code, 0)
         return output.getvalue()
+
+    def test_large_runs_print_only_the_largest_entries_and_summary(self):
+        # regression: jarvis's first run printed ~63k lines; journald dropped the summary and errors
+        for i in range(reaper.SHOWN + 5):
+            self.tree(f"stale-{i}")
+        big = self.tree("big")
+        (big / "nested/more").write_bytes(b"x" * 65536)
+        self.age(big)
+        output = self.run_reaper(dry=True)
+        listed = [line for line in output.splitlines() if line.startswith("would remove ")]
+        self.assertEqual(len(listed), reaper.SHOWN)
+        self.assertIn("'" + str(big) + "'", listed[0])
+        self.assertIn("... and 6 smaller entries", output)
+        self.assertIn(f"{reaper.SHOWN + 6} entries", output)
+        everything = self.run_reaper(dry=True, extra=["--list"])
+        self.assertEqual(len([l for l in everything.splitlines() if l.startswith("would remove ")]), reaper.SHOWN + 6)
 
     def test_nested_mtime_and_atime_keep_whole_tree(self):
         for clock in ("mtime", "atime"):
