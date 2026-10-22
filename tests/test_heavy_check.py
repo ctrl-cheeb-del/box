@@ -1,4 +1,4 @@
-"""Linux integration tests using real processes, isolated state and tiny jobs."""
+"""Linux/macOS integration tests using real processes, isolated state and tiny jobs."""
 import importlib.machinery
 import importlib.util
 import contextlib
@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 import shutil
+import sqlite3
+from unittest import mock
 
 QUEUE = Path(__file__).resolve().parents[1] / "bin/heavy-check"
 
@@ -55,11 +57,156 @@ class QueueTests(unittest.TestCase):
         return self.wait(lambda: (j if (j := self.jobs()[job])["finished"] else None))
 
     def tearDown(self):
+        jobs = self.jobs() if self.ids else {}
         for job in self.ids:
-            self.cli("cancel", job, check=False)
+            self.cli("cancel", job, cwd=jobs[job]["cwd"], check=False)
         for job in self.ids:
             self.finished(job)
         self.temp.cleanup()
+
+    def foreground(self, code="pass", cwd=None):
+        process = subprocess.Popen([sys.executable, str(QUEUE), "run", "--", sys.executable, "-c", code],
+                                   cwd=cwd or self.root, env=self.env, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        def cleanup():
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=15)
+        self.addCleanup(cleanup)
+        job = self.wait(lambda: next((j for j in self.jobs().values() if j["submitter"] == process.pid), None))
+        self.ids.append(job["id"])
+        return process, job
+
+    def test_queue_diagnostics_show_position_holders_memory_and_changes(self):
+        self.configure(slots=1)
+        holder = self.submit("import time; time.sleep(30)")
+        running = self.wait(lambda: (j if (j := self.jobs()[holder])["state"] == "running" else None))
+        other = self.root / "other"
+        other.mkdir()
+        waiting = self.submit("pass", other)
+        self.wait(lambda: "queued position=1/1" in self.cli("logs", waiting).stdout)
+        log = self.cli("logs", waiting).stdout
+        for expected in ("slots full", "memory available=", "required=0.0 GiB", "ETA unknown",
+                         f"id={holder}", f"pid={running['pgid']}", f"cwd={self.root.resolve()}", "command=", "running="):
+            self.assertIn(expected, log)
+        same = self.submit("pass")
+        self.wait(lambda: "same cwd already running" in self.cli("logs", same).stdout)
+        self.wait(lambda: "queued position=1/2" in self.cli("logs", waiting).stdout)
+        self.cli("cancel", waiting, cwd=other)
+        self.assertEqual(self.finished(waiting)["code"], 130)
+
+    def test_cancel_defaults_to_cwd_and_explicit_targets_cannot_cross_it(self):
+        self.configure(reserve=1000000)
+        first = self.submit("pass")
+        second = self.submit("pass")
+        other = self.root / "other"
+        other.mkdir()
+        foreign = self.submit("pass", other)
+        for args in ((foreign,), ("--id", foreign), ("--pid", str(self.jobs()[foreign]["owner"]))):
+            result = self.cli("cancel", *args, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no matching job owned by you in this cwd", result.stderr)
+        result = self.cli("cancel")
+        self.assertIn(first, result.stdout)
+        self.assertIn(second, result.stdout)
+        for job in (first, second):
+            final = self.finished(job)
+            self.assertEqual(final["code"], 130)
+            self.assertIn("cancel verb", final["cancel_reason"])
+            self.assertIsNotNone(final["cancel_pid"])
+            self.assertIsNotNone(final["cancel_at"])
+        self.assertEqual(self.jobs()[foreign]["state"], "queued")
+        self.cli("cancel", "--pid", str(self.jobs()[foreign]["owner"]), cwd=other)
+        self.assertEqual(self.finished(foreign)["code"], 130)
+
+    def test_explicit_cancel_reaches_foreground_caller_with_reason(self):
+        self.configure(reserve=1000000)
+        process, job = self.foreground("raise Exception('must not run')")
+        result = self.cli("cancel", "--id", job["id"])
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 130)
+        self.assertEqual(stdout, "")
+        self.assertIn(f"id={job['id']} pid={job['owner']}", stderr)
+        self.assertIn("cancelled (exit 130): cancel verb by pid=", stderr)
+        self.assertIn(self.jobs()[job["id"]]["cancel_reason"], self.cli("status").stdout)
+        self.assertIn(job["id"], result.stdout)
+
+    def test_caller_signal_only_cancels_its_job_and_records_sender(self):
+        self.configure(reserve=1000000)
+        first, job = self.foreground()
+        other = self.root / "other"
+        other.mkdir()
+        second, survivor = self.foreground(cwd=other)
+        os.killpg(first.pid, signal.SIGTERM)
+        _, stderr = first.communicate(timeout=15)
+        self.assertEqual(first.returncode, 130)
+        final = self.jobs()[job["id"]]
+        self.assertEqual(final["cancel_signal"], signal.SIGTERM)
+        self.assertIn("SIGTERM", final["cancel_reason"])
+        if hasattr(signal, "sigtimedwait"):
+            self.assertEqual(final["cancel_pid"], os.getpid())
+        else:
+            self.assertIn("sender pid=unknown", final["cancel_reason"])
+        self.assertIn(final["cancel_reason"], stderr)
+        self.assertEqual(self.jobs()[survivor["id"]]["state"], "queued")
+        self.configure()
+        second.communicate(timeout=15)
+        self.assertEqual(second.returncode, 0)
+
+    def test_queued_workers_survive_term_and_recover_after_kill(self):
+        self.configure(reserve=1000000)
+        self.env["HEAVY_CHECK_TEST_ORIGINAL"] = "original"
+        process, job = self.foreground("import os; print(os.environ['HEAVY_CHECK_TEST_ORIGINAL'])")
+        self.env["HEAVY_CHECK_TEST_ORIGINAL"] = "changed"
+        self.wait(lambda: "queued position=" in self.cli("logs", job["id"]).stdout)
+        os.kill(job["owner"], signal.SIGTERM)
+        self.wait(lambda: self.jobs()[job["id"]]["recovery_reason"])
+        retained = self.jobs()[job["id"]]
+        self.assertEqual(retained["state"], "queued")
+        self.assertIn("SIGTERM", retained["recovery_reason"])
+        os.kill(job["owner"], signal.SIGKILL)
+        recovered = self.wait(lambda: (j if (j := self.jobs()[job["id"]])["owner"] != job["owner"] else None))
+        self.assertEqual(recovered["state"], "queued")
+        self.assertIn("disappeared", recovered["recovery_reason"])
+        self.configure()
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout.strip(), "original")
+        self.assertNotIn("environment", recovered)
+        self.assertIn("restarted", stderr)
+
+    def test_dead_caller_does_not_own_or_cancel_worker(self):
+        self.configure(reserve=1000000)
+        process, job = self.foreground()
+        os.kill(process.pid, signal.SIGKILL)
+        process.communicate(timeout=15)
+        self.assertEqual(self.jobs()[job["id"]]["state"], "queued")
+        self.configure()
+        self.assertEqual(self.finished(job["id"])["code"], 0)
+
+    def test_running_worker_death_is_not_success_and_other_queued_jobs_survive(self):
+        self.configure(slots=1)
+        process, job = self.foreground("import time; time.sleep(30)")
+        running = self.wait(lambda: (j if (j := self.jobs()[job["id"]])["state"] == "running" else None))
+        other = self.root / "other"
+        other.mkdir()
+        queued = self.submit("print('survived')", other)
+        os.kill(running["owner"], signal.SIGKILL)
+        _, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 125)
+        self.assertIn("lost (exit 125)", stderr)
+        self.assertIn("disappeared", stderr)
+        self.assertEqual(self.finished(queued)["code"], 0)
+
+    def test_running_worker_signal_cancels_with_reason_and_releases_slot(self):
+        self.configure(slots=1)
+        process, job = self.foreground("import time; time.sleep(30)")
+        running = self.wait(lambda: (j if (j := self.jobs()[job["id"]])["state"] == "running" else None))
+        os.kill(running["owner"], signal.SIGTERM)
+        _, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 130)
+        self.assertIn("SIGTERM", stderr)
+        self.assertEqual(self.finished(self.submit("pass"))["code"], 0)
 
     def test_two_slots_fifo_and_async_submission(self):
         events = self.root / "events"
@@ -198,6 +345,80 @@ class QueueTests(unittest.TestCase):
         subprocess.run(installer + ["--uninstall"], check=True, capture_output=True)
         self.assertNotIn(b"box-heavy-check-launcher-v1", executable.read_bytes()[:256])
         subprocess.run([str(executable), "--version"], check=True, capture_output=True)
+
+
+class QueueMetadataTests(unittest.TestCase):
+    def setUp(self):
+        loader = importlib.machinery.SourceFileLoader("queue_metadata", str(QUEUE))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.queue = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.queue)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.queue.ROOT = Path(self.temp.name)
+
+    def test_legacy_database_is_migrated_without_losing_jobs(self):
+        with sqlite3.connect(self.queue.ROOT / "queue.sqlite") as db:
+            db.execute("""CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, created REAL, cwd TEXT, command TEXT,
+                state TEXT, owner INTEGER, identity TEXT, pgid INTEGER,
+                child_identity TEXT, started REAL, finished REAL, code INTEGER,
+                cancel INTEGER DEFAULT 0)""")
+            db.execute("INSERT INTO jobs (id,state,code) VALUES ('old','done',0)")
+        with self.queue.database() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id='old'").fetchone()
+            self.assertEqual(job["code"], 0)
+            self.assertIsNone(job["cancel_reason"])
+            self.assertIsNone(job["uid"])
+        with self.queue.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+
+    def test_reaping_worker_preserves_original_cancel_request(self):
+        with self.queue.database() as db:
+            db.execute("""INSERT INTO jobs (id,state,owner,identity,cancel,cancel_reason,cancel_pid)
+                VALUES ('dying','running',424242,'old',1,'cancel verb by pid=123',123)""")
+            with mock.patch.object(self.queue, "identity", return_value=None):
+                self.queue.reap(db)
+            job = db.execute("SELECT * FROM jobs WHERE id='dying'").fetchone()
+            self.assertEqual(job["state"], "lost")
+            self.assertEqual(job["code"], 125)
+            self.assertEqual(job["cancel_reason"], "cancel verb by pid=123")
+            self.assertEqual(job["cancel_pid"], 123)
+            self.assertIn("disappeared", job["recovery_reason"])
+
+    def test_notices_only_change_or_heartbeat_and_first_cancel_reason_wins(self):
+        queue = self.queue
+        with queue.database() as db:
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity)
+                VALUES ('waiting',0,?,'["unused"]','queued',?,?)""",
+                       (str(queue.ROOT), os.getpid(), queue.identity(os.getpid())))
+        ticks = iter((0.25, 30.5, 31))
+        clock = [0]
+        def advance(_):
+            clock[0] = next(ticks)
+            if clock[0] == 31:
+                with queue.database() as db:
+                    queue.request_cancel(db, "waiting", "first cancel", 123)
+                    queue.request_cancel(db, "waiting", "second cancel", 456)
+        stderr = io.StringIO()
+        config = {"slots": 1, "reserve_gib": 6, "headroom_gib": 4}
+        with mock.patch.object(queue, "settings", return_value=config), \
+             mock.patch.object(queue, "available_gib", return_value=2.25), \
+             mock.patch.object(queue, "watch_signals"), \
+             mock.patch.object(queue, "pending_signal", return_value=None), \
+             mock.patch.object(queue.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(queue.time, "sleep", side_effect=advance), \
+             contextlib.redirect_stderr(stderr):
+            self.assertEqual(queue.work("waiting"), 130)
+        output = stderr.getvalue()
+        self.assertEqual(output.count("queued position=1/1"), 2)
+        self.assertIn("waiting for memory", output)
+        self.assertIn("available=2.2 GiB required=10.0 GiB", output)
+        self.assertIn("cancelled (exit 130): first cancel", output)
+        with queue.database() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id='waiting'").fetchone()
+            self.assertEqual(job["cancel_pid"], 123)
+            self.assertEqual(job["code"], 130)
 
 
 class WiringTests(unittest.TestCase):

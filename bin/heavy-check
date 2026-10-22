@@ -13,11 +13,14 @@ import sys
 import time
 import uuid
 import re
+import shlex
 
-ROOT = Path(os.environ.get("HEAVY_CHECK_STATE", Path.home() / ".local/state/box/heavy-check"))
-CONFIG = Path(os.environ.get("HEAVY_CHECK_CONFIG", Path.home() / ".config/box/heavy-check.json"))
+ROOT = Path(os.environ.get("HEAVY_CHECK_STATE", Path.home() / ".local/state/box/heavy-check")).absolute()
+CONFIG = Path(os.environ.get("HEAVY_CHECK_CONFIG", Path.home() / ".config/box/heavy-check.json")).absolute()
 DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4}
-STOP = False
+STOP = None
+SIGNALS = {signal.SIGINT, signal.SIGTERM}
+HEARTBEAT = 30
 BOOT = None
 
 
@@ -83,6 +86,13 @@ def database():
         cancel INTEGER DEFAULT 0)""")
     db.execute("BEGIN IMMEDIATE")
     try:
+        # Migrate queues created by older installed runners under the same lock.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+        for name, kind in {"uid": "INTEGER", "submitter": "INTEGER", "environment": "TEXT", "cancel_reason": "TEXT",
+                           "cancel_pid": "INTEGER", "cancel_signal": "INTEGER",
+                           "cancel_at": "REAL", "recovery_reason": "TEXT"}.items():
+            if name not in columns:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
         yield db
         db.execute("COMMIT")
     except BaseException:
@@ -94,13 +104,22 @@ def database():
 
 def reap(db):
     for job in db.execute("SELECT * FROM jobs WHERE state IN ('queued','running')").fetchall():
-        if identity(job["owner"]) == job["identity"]:
+        current = identity(job["owner"])
+        if current is not None and current == job["identity"]:
+            continue
+        if job["state"] == "queued":
+            reason = f"queued worker pid={job['owner']} disappeared (signal/sender unknown); restarted"
+            db.execute("UPDATE jobs SET recovery_reason=? WHERE id=?", (reason, job["id"]))
+            launch(db, job["id"])
             continue
         # If the supervisor was SIGKILLed, kill its still-identifiable child group.
         # The child inherits the slot lock, so a surviving command never frees capacity.
         if job["pgid"] and identity(job["pgid"]) == job["child_identity"]:
             signal_group(job["pgid"], signal.SIGKILL)
-        db.execute("UPDATE jobs SET state='lost',finished=?,code=125 WHERE id=?", (time.time(), job["id"]))
+        reason = f"running worker pid={job['owner']} disappeared (signal/sender unknown)"
+        db.execute("""UPDATE jobs SET state='lost',finished=?,code=125,
+            cancel_reason=COALESCE(cancel_reason,?),recovery_reason=? WHERE id=?""",
+                   (time.time(), reason, reason, job["id"]))
 
 
 def nested():
@@ -151,7 +170,116 @@ def heavy_bun(args):
 
 def stop(signum, frame):
     global STOP
-    STOP = True
+    STOP = (signum, None)
+
+
+def watch_signals():
+    for signum in SIGNALS:
+        signal.signal(signum, stop)
+    # Linux exposes siginfo, including the sending PID. Darwin's Python signal
+    # handler only supplies the number, so leave the sender explicitly unknown.
+    if hasattr(signal, "sigtimedwait"):
+        signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+
+
+def pending_signal():
+    global STOP
+    if hasattr(signal, "sigtimedwait"):
+        info = signal.sigtimedwait(SIGNALS, 0)
+        if info is not None:
+            return info.si_signo, info.si_pid or None
+    result, STOP = STOP, None
+    return result
+
+
+def unblock_signals():
+    # Popen children must not inherit our sigtimedwait mask.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS)
+
+
+def signal_reason(event, recipient):
+    signum, sender = event
+    return (f"signal {signum} ({signal.Signals(signum).name}) to {recipient}; "
+            f"sender pid={sender if sender is not None else 'unknown'}")
+
+
+def request_cancel(db, job_id, reason, pid=None, signum=None):
+    # Preserve the first request if a signal races an explicit cancel.
+    db.execute("""UPDATE jobs SET cancel=1,cancel_reason=?,cancel_pid=?,cancel_signal=?,cancel_at=?
+        WHERE id=? AND cancel=0 AND state IN ('queued','running')""",
+               (reason, pid, signum, time.time(), job_id))
+
+
+def launch(db, job_id, foreground=False):
+    job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    env = json.loads(job["environment"]) if job["environment"] else os.environ.copy()
+    env.update(HEAVY_CHECK_STATE=str(ROOT), HEAVY_CHECK_CONFIG=str(CONFIG))
+    with open(ROOT / f"{job_id}.log", "ab", buffering=0) as log:
+        with open(ROOT / f"{job_id}.stdout", "ab", buffering=0) as output:
+            child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_work", job_id],
+                                     stdin=None if foreground else subprocess.DEVNULL,
+                                     stdout=output, stderr=log, start_new_session=True,
+                                     preexec_fn=unblock_signals, env=env)
+            if job["recovery_reason"]:
+                log.write(f"[heavy-check {job_id}] {job['recovery_reason']}; worker pid={child.pid}\n".encode())
+    db.execute("UPDATE jobs SET owner=?,identity=? WHERE id=?", (child.pid, identity(child.pid), job_id))
+    return child
+
+
+def queue_notice(db, job, config, available, required, now):
+    queued = db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created,id").fetchall()
+    running = db.execute("SELECT * FROM jobs WHERE state='running' ORDER BY started,id").fetchall()
+    eligible = [q for q in queued if not any(r["cwd"] == q["cwd"] for r in running)]
+    position = next(i + 1 for i, q in enumerate(queued) if q["id"] == job["id"])
+    gates = []
+    if any(r["cwd"] == job["cwd"] for r in running):
+        gates.append("same cwd already running")
+    if any(q["id"] == job["id"] for q in eligible) and eligible[0]["id"] != job["id"]:
+        gates.append("eligible jobs ahead")
+    if len(running) >= config["slots"]:
+        gates.append("slots full")
+    if available < required:
+        gates.append("memory")
+    # Quantize memory to GiB: small fluctuations must not spam every poll.
+    snapshot = (position, len(queued), tuple((r["id"], r["pgid"]) for r in running),
+                tuple(gates), int(available), required, config["slots"],
+                config["headroom_gib"], config["reserve_gib"])
+    lines = [f"queued position={position}/{len(queued)}; waiting for {', '.join(gates) or 'slot lock'}; "
+             f"memory available={available:.1f} GiB required={required:.1f} GiB "
+             f"(headroom={config['headroom_gib']:g}, reserve={config['reserve_gib']:g}); ETA unknown"]
+    for other in running:
+        lines.append(f"slot: id={other['id']} pid={other['pgid']} worker={other['owner']} "
+                     f"running={int(now - other['started'])}s cwd={other['cwd']} "
+                     f"command={shlex.join(json.loads(other['command']))}")
+    if not running:
+        lines.append("slots: no running jobs")
+    return snapshot, "\n".join(lines)
+
+
+def wait_for_job(job_id, child):
+    watch_signals()
+    # Separate files preserve stdout/stderr and allow a recovered worker to append.
+    with open(ROOT / f"{job_id}.stdout", "rb") as output, open(ROOT / f"{job_id}.log", "rb") as log:
+        while True:
+            with database() as db:
+                reap(db)
+                event = pending_signal()
+                if event:
+                    request_cancel(db, job_id, signal_reason(event, f"caller pid={os.getpid()}"),
+                                   event[1], event[0])
+                job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            for source, target in ((output, sys.stdout.buffer), (log, sys.stderr.buffer)):
+                data = source.read()
+                if data:
+                    target.write(data)
+                    target.flush()
+            child.poll()  # Reap our worker; recovered workers may have another parent.
+            if job["finished"] is not None:
+                if job["state"] == "lost":
+                    print(f"[heavy-check {job_id}] lost (exit 125): {job['cancel_reason']}",
+                          file=sys.stderr, flush=True)
+                return job["code"] if job["code"] is not None else 125
+            time.sleep(0.25)
 
 
 def signal_group(pgid, signum):
@@ -189,19 +317,30 @@ def terminate(child):
 
 
 def work(job_id):
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+    watch_signals()
+    with database() as db:
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        # A launch whose transaction rolled back must not execute the job.
+        if not job or job["owner"] != os.getpid() or job["state"] != "queued":
+            return 125
     child = None
     slot = None
     state, code = "failed", 125
+    failure_reason = ""
     try:
-        last_notice = 0
+        last_notice, last_snapshot = 0, None
         while child is None:
             config = settings()
             with database() as db:
                 reap(db)
                 job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-                if STOP or job["cancel"]:
+                event = pending_signal()
+                if event:
+                    # A worker/supervisor shutdown is not a caller's cancellation.
+                    reason = signal_reason(event, f"queued worker pid={os.getpid()}") + "; queued job retained"
+                    db.execute("UPDATE jobs SET recovery_reason=? WHERE id=?", (reason, job_id))
+                    print(f"[heavy-check {job_id}] {reason}", file=sys.stderr, flush=True)
+                if job["cancel"]:
                     state, code = "cancelled", 130
                     break
                 first = db.execute("""SELECT q.id FROM jobs q WHERE q.state='queued'
@@ -209,7 +348,9 @@ def work(job_id):
                     ORDER BY q.created,q.id LIMIT 1""").fetchone()
                 # Account for a newly admitted job before its RSS has grown.
                 young = db.execute("SELECT COUNT(*) FROM jobs WHERE state='running' AND started>?", (time.time() - 10,)).fetchone()[0]
-                enough = available_gib() >= config["headroom_gib"] + config["reserve_gib"] * (1 + young)
+                available = available_gib()
+                required = config["headroom_gib"] + config["reserve_gib"] * (1 + young)
+                enough = available >= required
                 same_checkout = db.execute("SELECT 1 FROM jobs WHERE state='running' AND cwd=?", (job["cwd"],)).fetchone()
                 if first and first["id"] == job_id and enough and not same_checkout:
                     for number in range(config["slots"]):
@@ -223,20 +364,27 @@ def work(job_id):
                     if slot is not None:
                         env = os.environ | {"HEAVY_CHECK_JOB": job_id, "HEAVY_CHECK_STATE": str(ROOT)}
                         child = subprocess.Popen(json.loads(job["command"]), cwd=job["cwd"], env=env,
-                                                 start_new_session=True, pass_fds=(slot.fileno(),))
+                                                 start_new_session=True, pass_fds=(slot.fileno(),),
+                                                 preexec_fn=unblock_signals)
                         db.execute("UPDATE jobs SET state='running',pgid=?,child_identity=?,started=? WHERE id=?",
                                    (child.pid, identity(child.pid), time.time(), job_id))
-                if child is None and time.monotonic() - last_notice > 30:
-                    print(f"[heavy-check {job_id}] queued; waiting for a slot and memory", file=sys.stderr, flush=True)
-                    last_notice = time.monotonic()
+                if child is None:
+                    snapshot, notice = queue_notice(db, job, config, available, required, time.time())
+                    if snapshot != last_snapshot or time.monotonic() - last_notice >= HEARTBEAT:
+                        print(f"[heavy-check {job_id}] {notice}", file=sys.stderr, flush=True)
+                        last_notice, last_snapshot = time.monotonic(), snapshot
             if child is None:
                 time.sleep(0.25)
         if child is not None:
             print(f"[heavy-check {job_id}] running", file=sys.stderr, flush=True)
             while True:
                 with database() as db:
+                    event = pending_signal()
+                    if event:
+                        request_cancel(db, job_id, signal_reason(event, f"running worker pid={os.getpid()}"),
+                                       event[1], event[0])
                     cancelled = db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
-                if STOP or cancelled:
+                if cancelled:
                     terminate(child)
                     state, code = "cancelled", 130
                     break
@@ -246,16 +394,26 @@ def work(job_id):
                     terminate(child)
                     code = result if result >= 0 else 128 - result
                     state = "done" if code == 0 else "failed"
+                    if result < 0:
+                        failure_reason = signal_reason((-result, None), f"command pid={child.pid}")
                     break
                 time.sleep(0.25)
+    except (OSError, ValueError, RuntimeError) as error:
+        failure_reason = f"worker error: {error}"
     finally:
         if child is not None and child.poll() is None:
             terminate(child)
         with database() as db:
-            db.execute("UPDATE jobs SET state=?,code=?,finished=? WHERE id=?", (state, code, time.time(), job_id))
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if job["cancel"]:
+                state, code = "cancelled", 130
+            reason = job["cancel_reason"] or failure_reason or ("legacy cancel request; sender unknown" if job["cancel"] else "")
+            print(f"[heavy-check {job_id}] {state} (exit {code})" + (f": {reason}" if reason else ""),
+                  file=sys.stderr, flush=True)
+            db.execute("UPDATE jobs SET state=?,code=?,finished=?,cancel_reason=? WHERE id=?",
+                       (state, code, time.time(), reason or None, job_id))
         if slot is not None:
             slot.close()
-    print(f"[heavy-check {job_id}] {state} (exit {code})", file=sys.stderr, flush=True)
     return code
 
 
@@ -280,31 +438,62 @@ def main():
             parser.error("supply a command after --")
         if args.action == "run" and nested():
             os.execvpe(command[0], command, os.environ)
+        watch_signals()
         job_id = uuid.uuid4().hex[:12]
         with database() as db:
             reap(db)
-            db.execute("INSERT INTO jobs (id,created,cwd,command,state,owner,identity) VALUES (?,?,?,?,?,?,?)",
-                       (job_id, time.time(), os.getcwd(), json.dumps(command), "queued", os.getpid(), identity(os.getpid())))
-            if args.action == "submit":
-                with open(ROOT / f"{job_id}.log", "ab", buffering=0) as log:
-                    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_work", job_id],
-                                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-                db.execute("UPDATE jobs SET owner=?,identity=? WHERE id=?", (child.pid, identity(child.pid), job_id))
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,uid,submitter,environment)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                       (job_id, time.time(), os.getcwd(), json.dumps(command), "queued", os.getpid(),
+                        identity(os.getpid()), os.getuid(), os.getpid(), json.dumps(dict(os.environ))))
+            child = launch(db, job_id, foreground=args.action == "run")
+        print(f"[heavy-check {job_id}] queued id={job_id} pid={child.pid} caller={os.getpid()} cwd={os.getcwd()}",
+              file=sys.stderr, flush=True)
         if args.action == "submit":
             print(job_id)
             return 0
-        print(f"[heavy-check {job_id}] submitted", file=sys.stderr, flush=True)
-        return work(job_id)
+        return wait_for_job(job_id, child)
     with database() as db:
         reap(db)
         if args.action == "status":
             jobs = [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY created DESC LIMIT 50")]
+            for job in jobs:
+                job.pop("environment", None)
             if args.args == ["--json"]:
                 print(json.dumps(jobs))
             else:
-                print("ID            STATE       EXIT  COMMAND / DIRECTORY")
+                print("ID            STATE       EXIT  PID / COMMAND / DIRECTORY / REASON")
                 for job in jobs:
-                    print(f"{job['id']}  {job['state']:<10}  {str(job['code']):<4}  {json.loads(job['command'])!r} / {job['cwd']}")
+                    print(f"{job['id']}  {job['state']:<10}  {str(job['code']):<4}  "
+                          f"worker={job['owner']} child={job['pgid']} / {shlex.join(json.loads(job['command']))} / "
+                          f"{job['cwd']} / {job['cancel_reason'] or job['recovery_reason'] or ''}")
+            return 0
+        if args.action == "cancel":
+            cancel_parser = argparse.ArgumentParser(prog="heavy-check cancel",
+                description="Cancel jobs owned by this Unix user in the current working directory.")
+            target = cancel_parser.add_mutually_exclusive_group()
+            target.add_argument("job_id", nargs="?")
+            target.add_argument("--id")
+            target.add_argument("--pid", type=int)
+            selection = cancel_parser.parse_args(args.args)
+            jobs = db.execute("SELECT * FROM jobs WHERE cwd=? AND (uid=? OR uid IS NULL)",
+                              (os.getcwd(), os.getuid())).fetchall()
+            job_id = selection.id or selection.job_id
+            if job_id:
+                jobs = [job for job in jobs if job["id"] == job_id]
+            elif selection.pid is not None:
+                jobs = [job for job in jobs if selection.pid in (job["owner"], job["pgid"])
+                        and job["state"] in ("queued", "running")
+                        and identity(selection.pid) == (job["child_identity"] if selection.pid == job["pgid"]
+                                                        else job["identity"])]
+            if (job_id or selection.pid is not None) and not jobs:
+                cancel_parser.error("no matching job owned by you in this cwd; run cancel from its directory")
+            for job in jobs:
+                if job["state"] not in ("queued", "running"):
+                    continue
+                reason = f"cancel verb by pid={os.getpid()} uid={os.getuid()} cwd={os.getcwd()}"
+                request_cancel(db, job["id"], reason, os.getpid())
+                print(f"Cancellation requested for {job['id']} pid={job['owner']}: {reason}")
             return 0
         if len(args.args) != 1:
             parser.error("supply one job ID")
@@ -312,13 +501,11 @@ def main():
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not job:
             parser.error("unknown job ID")
-        if args.action == "cancel":
-            db.execute("UPDATE jobs SET cancel=1 WHERE id=?", (job_id,))
-            print(f"Cancellation requested for {job_id}")
-            return 0
     log = ROOT / f"{job_id}.log"
     if not log.exists():
-        parser.error("foreground jobs stream output to their caller; only submitted jobs have logs")
+        parser.error("no log file for this job (older foreground jobs only streamed to their caller)")
+    sys.stdout.write((ROOT / f"{job_id}.stdout").read_text(errors="replace")
+                     if (ROOT / f"{job_id}.stdout").exists() else "")
     sys.stdout.write(log.read_text(errors="replace"))
     return 0
 
