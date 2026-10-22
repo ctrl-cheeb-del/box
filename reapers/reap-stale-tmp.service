@@ -1,0 +1,6 @@
+[Unit]
+Description=Remove unused /tmp trees untouched for two days
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/reap-stale-tmp

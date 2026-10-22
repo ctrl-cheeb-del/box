@@ -199,6 +199,17 @@ systemctl list-unit-files tailscaled.service >/dev/null 2>&1 && echo "tailscale 
 systemctl --user list-unit-files gnome-remote-desktop.service 2>/dev/null | grep -q enabled && echo "remote desk $(ok $(systemctl --user is-active gnome-remote-desktop))"
 [ -d /sys/class/power_supply/BAT0 ] && echo "battery     $(cat /sys/class/power_supply/BAT0/capacity)% $(cat /sys/class/power_supply/BAT0/status) (cap $(cat /sys/class/power_supply/BAT0/charge_control_end_threshold)%)"
 echo "t3 connect  $(sh -lc 't3 connect status 2>/dev/null' | grep -E 'Exposure' | sed 's/.*: //')"
+# T3's Chrome has its own AppArmor profile; the Playwright profile does not cover it.
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ]; then
+  profile=t3-chrome-headless-shell
+  profiles=$(cat /sys/kernel/security/apparmor/profiles 2>/dev/null || sudo -n cat /sys/kernel/security/apparmor/profiles 2>/dev/null)
+  if ! grep -q 'userns,' "/etc/apparmor.d/$profile" 2>/dev/null || [ -e "/etc/apparmor.d/disable/$profile" ] ||
+     { [ -n "$profiles" ] && ! printf '%s\n' "$profiles" | grep -q "^$profile "; }; then
+    echo 't3 browser  NEEDS SETUP: sudo env "PATH=$PATH" t3 browser setup'
+  else
+    echo 't3 browser  AppArmor profile installed'
+  fi
+fi
 echo "memory      $(free -h | awk '/Mem/{print $3" used / "$2} /Swap/{print "(swap "$3" / "$2")"}' | paste -sd' ')"
 command -v sensors >/dev/null && echo "cpu temp    $(sensors 2>/dev/null | awk '/^Package id 0:/{print $4; exit}')"
 echo "disk        $(df -h / | awk 'NR==2{print $3" used / "$2}')"
@@ -274,6 +285,117 @@ cmd_sync_skills() {
   say "skills synced on ${(j:, :)ok:-nothing}"
 }
 
+# Search locally and over SSH. Only base64 data enters the remote shell command; both Python
+# source and query are decoded by python3 -c, so quotes/metacharacters stay literal.
+cmd_threads() {
+  [[ $1 == search && -n ${2//[[:space:]]/} ]] || { say 'usage: box threads search <query>'; return 1; }
+  shift
+  local query="$*" encoded source n h
+  encoded=$(printf %s "$query" | base64 | tr -d '\n')
+  source=$(cat <<'PY' | base64 | tr -d '\n'
+import base64
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+
+query = base64.b64decode(sys.argv[1]).decode().casefold()
+machine = sys.argv[2]
+root = Path(os.environ.get("T3CODE_HOME", str(Path.home() / ".t3")))
+db = root / "userdata/statev2.sqlite"
+threads, matches, sessions = {}, {}, {}
+
+
+def snippet(text):
+    text = " ".join(str(text).split())
+    pos = text.casefold().find(query)
+    start = max(0, pos - 60)
+    return ("…" if start else "") + text[start:start + 200] + ("…" if len(text) > start + 200 else "")
+
+
+def match(tid, text):
+    if tid in threads and tid not in matches and query in str(text).casefold():
+        matches[tid] = snippet(text)
+
+
+if db.is_file():
+    try:
+        with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=5) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            # Current records supersede imported legacy records, including deleted threads.
+            for table in ("projection_threads", "orchestration_v2_projection_threads"):
+                if table in tables:
+                    for tid, title, deleted in conn.execute("SELECT thread_id,title,deleted_at FROM " + table):
+                        threads[tid] = None if deleted else title
+            threads = {tid: title for tid, title in threads.items() if title is not None}
+            for tid, title in threads.items():
+                match(tid, title)
+            # Use a literal substring, not LIKE: % and _ in a query are ordinary text.
+            conn.create_function("contains_query", 1, lambda value: query in (value or "").casefold())
+            for table, column in (("orchestration_v2_projection_messages", "json_extract(payload_json, '$.text')"),
+                                  ("projection_thread_messages", "text")):
+                if table in tables:
+                    for tid, text in conn.execute("SELECT thread_id," + column + " FROM " + table +
+                                                  " WHERE contains_query(" + column + ") ORDER BY created_at DESC"):
+                        match(tid, text)
+            if "projection_thread_sessions" in tables:
+                for tid, sid, native in conn.execute("SELECT thread_id,provider_session_id,provider_thread_id FROM projection_thread_sessions"):
+                    for ref in (sid, native):
+                        if ref:
+                            sessions.setdefault(ref, set()).add(tid)
+            if "orchestration_v2_projection_provider_threads" in tables:
+                for tid, payload in conn.execute("SELECT thread_id,payload_json FROM orchestration_v2_projection_provider_threads"):
+                    ref = (json.loads(payload).get("nativeThreadRef") or {}).get("nativeId")
+                    if ref:
+                        sessions.setdefault(ref, set()).add(tid)
+    except (sqlite3.Error, ValueError) as exc:
+        print(machine + ": T3 search failed: " + str(exc), file=sys.stderr)
+        sys.exit(1)
+else:
+    print(machine + ": no T3 database at " + str(db), file=sys.stderr)
+
+# Claude tool output can contain a match absent from T3's displayed messages. Search linked
+# transcripts only, so every result still identifies a T3 thread rather than an unrelated CLI session.
+for path in (Path.home() / ".claude/projects").glob("**/*.jsonl"):
+    tids = sessions.get(path.stem, set()) - matches.keys()
+    if not tids:
+        continue
+    try:
+        with path.open(errors="replace") as transcript:
+            for line in transcript:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                content = (event.get("message") or {}).get("content", "")
+                text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                if query in text.casefold():
+                    for tid in tids:
+                        match(tid, text)
+                    break
+    except OSError as exc:
+        print(machine + ": cannot read transcript " + str(path) + ": " + str(exc), file=sys.stderr)
+
+for tid in sorted(matches, key=lambda tid: (threads[tid].casefold(), tid)):
+    # JSON quoting keeps terminal escapes, tabs and newlines in titles/snippets harmless.
+    print("\t".join((machine, tid, json.dumps(threads[tid], ensure_ascii=False),
+                     json.dumps(matches[tid], ensure_ascii=False))))
+PY
+  )
+  printf 'MACHINE\tTHREAD ID\tTITLE\tSNIPPET\n'
+  local failed=0 searched=0
+  for n in $M_NAMES; do
+    TARGET=$n; h=$(resolve 2>/dev/null) || { say 'unreachable, skipped'; continue; }
+    on "$h" "python3 -c 'import base64; exec(base64.b64decode(\"$source\"))' '$encoded' '$n'" \
+      && (( searched += 1 )) || failed=1
+  done
+  TARGET=""
+  (( searched )) || { say 'no machine could be searched'; return 1; }
+  return $failed
+}
+
 cmd_update() {
   need_box update || return 1
   local h; h=$(resolve) || return 1
@@ -304,10 +426,11 @@ Reach any machine from any other, home network first and Tailscale otherwise:
 
 Commands ([machine] defaults to $(machine_with_role default); "all" means every machine):
   box list                      every machine and whether it's reachable right now
-  box status [machine|all]      health check: services, Claude, battery, T3 Connect, disk
+  box status [machine|all]      health check: services, Claude, browser sandbox, battery, disk
   box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
   box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
   box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
+  box threads search <query>    search T3 titles, messages and Claude transcripts on every machine
   box sync-memory               two-way sync of revnu2 Claude memories with every machine
   box sync-skills               install bot-loop from revnu2 main on every machine (also runs hourly)
   box usage                     5-hour and weekly use per Claude account
@@ -343,6 +466,7 @@ case $cmd in
   claude-login) cmd_claude_login ;;
   usage|u) cmd_usage ;;
   update) each cmd_update ;;
+  threads) cmd_threads "${args[@]}" ;;
   sync-memory) cmd_sync_memory ;;
   sync-skills) cmd_sync_skills ;;
   reboot) cmd_reboot ;;
