@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix="heavy-check-probe-") as directory:
         if not job:
             raise RuntimeError("normal bun run check did not enter the queue")
         if job["state"] == "queued":
-            subprocess.run([runner, "cancel", job["id"]], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run([runner, "cancel", job["id"]], cwd=root, check=True, stdout=subprocess.DEVNULL)
         stdout, stderr = process.communicate(timeout=15)
         rows = json.loads(subprocess.check_output([runner, "status", "--json"], text=True))
         final = next(row for row in rows if row["id"] == job["id"])

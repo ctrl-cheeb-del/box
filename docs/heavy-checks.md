@@ -46,11 +46,22 @@ python3 bin/install-heavy-checks --uninstall
 bun run check                         # existing command, now queued
 heavy-check run -- bun run check      # foreground; preserves output and exit status
 heavy-check submit -- bun run check   # returns a job ID immediately
-heavy-check status                    # latest 50 jobs, command, directory, exit code
+heavy-check status                    # latest 50 jobs, PIDs, command, directory, exit code/reason
 heavy-check status --json
-heavy-check logs JOB_ID               # background job's accumulated output
-heavy-check cancel JOB_ID             # queued or running job
+heavy-check logs JOB_ID               # accumulated stdout, then stderr/queue diagnostics
+heavy-check cancel                    # cancel active jobs in this cwd only
+heavy-check cancel JOB_ID             # precise queued/running job in this cwd
+heavy-check cancel --id JOB_ID        # same explicit ID form
+heavy-check cancel --pid PID          # current worker or command PID, in this cwd
 ```
+
+`run` and `submit` print the job ID and detached worker PID to stderr when queued;
+`submit` continues to print only the ID to stdout for scripts. `status` shows worker
+and command PIDs. `cancel` is scoped to the current Unix user and exact working
+directory, including explicit ID/PID targets; run it from the job's recorded cwd.
+On a shared Unix account, the cwd is the ownership boundary: agents sharing the
+same cwd also share its jobs. Target an ID to cancel only one of them. This replaces
+`pkill -f`, which can match other agents across the box. Finished jobs are unchanged.
 
 For agents: use `submit` for long checks, do independent work, then read status and
 logs before reporting verification. A queued job is **not** a successful check.
@@ -65,6 +76,15 @@ Defaults: two slots, one running job per working directory, FIFO among
 eligible jobs. A checkout waiting on its own running check does not block other
 checkouts. Nested foreground commands in an existing queued process group reuse
 its slot, so a full check can call queued typechecks without deadlocking.
+
+While waiting, diagnostics show the FIFO queue position (including jobs blocked by
+their own cwd), the actual admission gates, and each slot holder's job ID, command
+PID, worker PID, cwd, command and elapsed runtime. Memory diagnostics compare
+available GiB to the current requirement, including reserves for young jobs.
+They update when position, holders, gates, memory requirement or available whole
+GiB changes, with a 30-second heartbeat otherwise. Runtime is refreshed on those
+updates. ETA is explicitly unknown: command duration and future memory availability
+cannot be predicted reliably. Full typechecks still use the memory gate.
 
 A job starts only when available memory is at least 10 GiB: 6 GiB estimated
 working memory plus 4 GiB headroom. Jobs started in the previous 10 seconds each
@@ -88,14 +108,42 @@ configuration and state paths for every worktree to share capacity. Historical
 records/logs are retained in this basic version; no automatic log retention,
 per-agent round-robin scheduling, or automatic replacement of queued jobs yet.
 
-SIGINT/SIGTERM cancels a foreground job. Cancellation sends TERM, then KILL after
-two seconds, to the entire command process group. Background children remaining
-after a command exits are also stopped: this queue is for finite checks, not dev
-servers. Stale supervisors are detected using boot ID plus process start time
-(Linux clock ticks; macOS `ps` timestamps), not PID alone; still-identifiable command groups are killed. The command inherits
-the slot's kernel lock, preventing over-admission if its supervisor dies. Children
-that deliberately create a new session escape process-group cancellation; use
-systemd/cgroup isolation if that needs enforcing.
+Every job has its own worker in a detached session, including foreground `run`.
+The foreground caller streams the worker's saved stdout and stderr and waits for
+the recorded exit status. There is no shared daemon or global cancel flag. The old
+foreground runner itself supervised the job and converted any SIGINT/SIGTERM into
+an unexplained exit 130; a broad process/group signal could therefore cancel many
+independent foreground runs at once.
+
+SIGINT/SIGTERM **to the foreground caller** requests cancellation of that job only.
+The `cancel` verb records the requester's PID, UID, cwd and timestamp. Signals
+record their number/name, recipient and sender PID on Linux via `sigtimedwait`;
+macOS's Python handler cannot identify the sender and records `unknown`. The first
+cancellation reason is retained in `status` (also in `status --json`) and the waiting
+caller's stderr. Cancelled jobs always return 130; failed/lost workers return 125,
+never success. A successful `submit` or `cancel` means the request was accepted,
+not that verification succeeded. Shell wrappers must propagate `run`'s exit code.
+
+A SIGTERM/SIGINT **to a queued worker** is recorded as an interruption and leaves
+the job queued. If a queued worker disappears (including SIGKILL), the next caller,
+worker or `status` invocation restarts it with the same ID, FIFO position, cwd and
+saved environment; a dead foreground caller does not cancel its detached worker.
+If all processes are killed, invoke `status` or another queue command to recover
+queued jobs. Recovery is reported in logs and `status`. This cannot identify an
+unobserved SIGKILL's sender or signal number. Queued recovery uses closed stdin;
+these commands should be noninteractive. Saved environments stay in the private
+state directory and are omitted from `status --json`.
+
+SIGINT/SIGTERM to a **running worker** cancels its command and records the signal.
+Cancellation sends TERM, then KILL after two seconds, to the entire command process
+group. Background children remaining after a command exits are also stopped: this
+queue is for finite checks, not dev servers. Stale workers are detected using boot
+ID plus process start time (Linux clock ticks; macOS `ps` timestamps), not PID alone.
+A running job whose worker disappears is marked `lost` (125), with a reason, and
+its still-identifiable command group is killed; it is never rerun automatically.
+The command inherits the slot's kernel lock, preventing over-admission if its worker
+dies. Children that deliberately create a new session escape process-group
+cancellation; use systemd/cgroup isolation if that needs enforcing.
 
 ## Test
 
