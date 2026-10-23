@@ -150,6 +150,24 @@ def positional(args):
     return result
 
 
+def self_queued(args, script):
+    """A project lists scripts that validate their own arguments and then call
+    `heavy-check run` themselves, so a usage error never waits for a slot."""
+    directory = Path(os.getcwd())
+    for flag in ("--cwd", "-C"):
+        if flag in args[:-1]:
+            directory = directory / args[args.index(flag) + 1]
+    for folder in (directory, *directory.parents):
+        package = folder / "package.json"
+        if package.is_file():
+            try:
+                listed = json.loads(package.read_text()).get("heavyCheck", {}).get("selfQueued", [])
+            except (OSError, ValueError, AttributeError):
+                return False
+            return isinstance(listed, list) and script in listed
+    return False
+
+
 def heavy_bun(args):
     """Recognize full checks without requiring each checkout to carry wrappers."""
     if any(arg in ("--help", "-h", "--version", "-v") for arg in args):
@@ -159,6 +177,8 @@ def heavy_bun(args):
         return False
     command = words[0]
     if command == "run":
+        if len(words) > 1 and self_queued(args, words[1]):
+            return False
         return len(words) > 1 and words[1].split(":", 1)[0] in {"check", "typecheck", "build", "test"}
     if command == "test":
         # A named file or test-name filter is a targeted test; let it run freely.
