@@ -107,16 +107,20 @@ cmd_ssh() {
 }
 
 # FreeRDP by default: the Windows App dropped every session after ~1 min against GNOME's RDP
-# server (0x200d), FreeRDP held. Password comes from the Keychain item "agentbox-rdp".
+# server (0x200d), FreeRDP held. Password comes from the Keychain item "agentbox-rdp"; a Windows PC
+# has its own Windows password, in "box-rdp-<machine>".
 cmd_desktop() {
-  need_mac desktop && need_box desktop || return 1
+  need_mac desktop || return 1
+  has_role $TARGET windows || need_box desktop || return 1
   [[ $1 == --windows-app ]] && { cmd_desktop_windows_app; return; }
-  local h pw; h=$(resolve 3389) || return 1
-  pw=$(security find-generic-password -a "$USER_NAME" -s agentbox-rdp -w 2>/dev/null) || {
-    say "no password in Keychain; add it with: security add-generic-password -a art -s agentbox-rdp -w"
+  local h pw user=${M_USER[$TARGET]} item=agentbox-rdp
+  has_role $TARGET windows && item=box-rdp-$TARGET
+  h=$(resolve 3389) || return 1
+  pw=$(security find-generic-password -a "$user" -s $item -w 2>/dev/null) || {
+    say "no password in Keychain; add it with: security add-generic-password -a $user -s $item -w"
     return 1
   }
-  nohup /opt/homebrew/bin/sdl-freerdp "/v:$h" "/u:$USER_NAME" "/p:$pw" /cert:ignore \
+  nohup /opt/homebrew/bin/sdl-freerdp "/v:$h" "/u:$user" "/p:$pw" /cert:ignore \
     /dynamic-resolution /size:1600x1000 +clipboard /audio-mode:2 \
     +auto-reconnect /auto-reconnect-max-retries:50 /log-level:ERROR \
     >"$CONF_DIR/freerdp-$TARGET.log" 2>&1 &!
@@ -444,7 +448,7 @@ Commands ([machine] defaults to $(machine_with_role default); "all" means every 
   box sync-skills               install bot-loop from revnu2 main on every machine (also runs hourly)
   box usage                     5-hour and weekly use per Claude account
   box claude-login              add or re-auth a Claude account in the proxy (needs Art in a browser)
-  box desktop [machine]         a box's Ubuntu desktop (Mac only)
+  box desktop [machine]         a box's Ubuntu desktop, or the Windows PC's screen (Mac only)
   box proxy | proxy-close       CLIProxyAPI dashboard (Mac only)
 
 Machines are listed in ${MACHINES_FILE:A}. Full notes: ${MACHINES_FILE:A:h}/docs/machines.md
