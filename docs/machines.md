@@ -345,3 +345,17 @@ Nous Research's personal agent, installed to look around in. **No tasks, cron jo
   auth provider (password/OAuth), so reach it with an SSH tunnel (`ssh -L 9119:localhost:9119 skynet`), never by binding 0.0.0.0.
 - Messaging isn't configured. Telegram/WhatsApp/Slack/Discord/Signal via `hermes gateway setup`; iMessage via
   BlueBubbles (needs an always-on Mac) or Photon (`hermes photon setup --phone ...`, no Mac).
+
+## Windows PC: pc (2026-10-24)
+
+Art's Windows gaming desktop (`DESKTOP-79OMK99`, Ryzen 7 5800X, RTX 4060), on Tailscale as
+`desktop-79omk99` (100.105.56.69). Role `windows`: SSH only when it's on. It is not an agent box: no T3,
+no Claude, no heartbeat, and `all`, `update`, `sync-memory`, `sync-skills` and `threads search` skip it.
+
+- `box pc` / `ssh pc`: PowerShell as `art`, home network first, then Tailscale.
+- OpenSSH Server is a Windows optional feature, service `sshd` set to Automatic; firewall rule `sshd-any`
+  allows port 22 on every profile.
+- Art's account is an administrator, so Windows reads keys from
+  `C:\ProgramData\ssh\administrators_authorized_keys` (only Administrators and SYSTEM may have access),
+  not `~\.ssh\authorized_keys`. The Mac's `art-macbook` key is in it.
+- Default SSH shell is Windows PowerShell (`HKLM:\SOFTWARE\OpenSSH\DefaultShell`).

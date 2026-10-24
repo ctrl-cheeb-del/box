@@ -19,14 +19,16 @@ fi
 TS="/usr/local/bin/tailscale"
 [[ $OSTYPE == darwin* ]] && ON_MAC=1 || ON_MAC=0
 
-typeset -A M_LAN M_TS M_ROLES
+typeset -A M_LAN M_TS M_ROLES M_USER
 M_NAMES=()
-while read -r name lan ts roles _; do
+while read -r name lan ts roles user _; do
   [[ -z $name || $name == \#* ]] && continue
-  M_NAMES+=($name); M_LAN[$name]=$lan; M_TS[$name]=$ts; M_ROLES[$name]=$roles
+  M_NAMES+=($name); M_LAN[$name]=$lan; M_TS[$name]=$ts; M_ROLES[$name]=$roles; M_USER[$name]=${user:-$USER_NAME}
 done < "$MACHINES_FILE"
 
 has_role() { [[ ",${M_ROLES[$1]}," == *",$2,"* ]]; }
+# Machines that "all" and the syncs go through: everything except Windows PCs, which are SSH-only.
+FLEET=(); for _n in $M_NAMES; do has_role $_n windows || FLEET+=($_n); done; unset _n
 machine_with_role() { local n; for n in $M_NAMES; do has_role $n $1 && { echo $n; return; }; done; }
 is_machine() { (( ${M_NAMES[(Ie)$1]} )); }
 # The machine this is running on: matched by hostname, or the "mac" role on macOS.
@@ -63,13 +65,17 @@ resolve() {
 }
 
 # on <host> <cmd...>: run on a resolved host, locally when it's this machine. `ont` gives it a terminal.
-on()  { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -T -o BatchMode=yes "$USER_NAME@$h" "$@"; }
-ont() { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -t "$USER_NAME@$h" "$@"; }
+on()  { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -T -o BatchMode=yes "${M_USER[$TARGET]:-$USER_NAME}@$h" "$@"; }
+ont() { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -t "${M_USER[$TARGET]:-$USER_NAME}@$h" "$@"; }
 
 run() { local h; h=$(resolve) || return 1; on "$h" "$@"; }
 
 # Commands that drive the Ubuntu services; the Mac has none of them.
-need_box() { has_role $TARGET mac || return 0; say "is the Mac; \`box $1\` is for the Linux boxes"; return 1; }
+need_box() {
+  has_role $TARGET mac && { say "is the Mac; \`box $1\` is for the Linux boxes"; return 1; }
+  has_role $TARGET windows && { say "is a Windows PC; \`box $1\` is for the Linux boxes"; return 1; }
+  return 0
+}
 # Commands that open a window or the clipboard on this computer.
 need_mac() { (( ON_MAC )) && return; say "\`box $1\` opens a window, so run it from the Mac"; return 1; }
 
@@ -95,6 +101,7 @@ cmd_ssh() {
   local h; h=$(resolve) || return 1
   [[ $h == self ]] && { say "is this machine"; return; }
   has_role $TARGET mac && { ssh -t "$USER_NAME@$h"; return; }
+  has_role $TARGET windows && { ssh -t "${M_USER[$TARGET]}@$h"; return; }
   # tmux keeps the shell alive if the connection drops; reattach with `box` again.
   ssh -t "$USER_NAME@$h" 'tmux new -A -s main'
 }
@@ -172,6 +179,7 @@ cmd_proxy_close() { pkill -f "ssh -f -N -o ExitOnForwardFailure=yes -L $PROXY_LO
 cmd_status() {
   local h; h=$(resolve) || return 1
   case $h in self) say "this machine" ;; ${M_LAN[$TARGET]}) say "reachable on home network" ;; *) say "reachable via Tailscale" ;; esac
+  has_role $TARGET windows && { say "Windows PC, SSH only: no services to check"; return; }
   if has_role $TARGET mac; then
     on "$h" 'bash -s' <<'EOF'
 echo "uptime      $(uptime | sed "s/.*up \([^,]*\),.*/\1/")"
@@ -246,7 +254,7 @@ cmd_claude_login() {
 cmd_sync_memory() {
   local n h r synced=() mine="$HOME/$(memory_dir $SELF)"
   mkdir -p "$mine"
-  for n in $M_NAMES; do
+  for n in $FLEET; do
     [[ $n == $SELF ]] && continue
     TARGET=$n; r=$(memory_dir $n)
     h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
@@ -263,7 +271,7 @@ cmd_sync_memory() {
 # so the global bot-loop everywhere is revnu2 main's.
 cmd_sync_skills() {
   local n h d="$BOX_REPO/skills" ok=()
-  for n in $M_NAMES; do
+  for n in $FLEET; do
     TARGET=$n; h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
     if [[ -r $d/sync-skills ]]; then
       on "$h" 'mkdir -p ~/.local/bin && cat > ~/.local/bin/sync-skills && chmod +x ~/.local/bin/sync-skills' < "$d/sync-skills" || continue
@@ -386,7 +394,7 @@ PY
   )
   printf 'MACHINE\tTHREAD ID\tTITLE\tSNIPPET\n'
   local failed=0 searched=0
-  for n in $M_NAMES; do
+  for n in $FLEET; do
     TARGET=$n; h=$(resolve 2>/dev/null) || { say 'unreachable, skipped'; continue; }
     on "$h" "python3 -c 'import base64; exec(base64.b64decode(\"$source\"))' '$encoded' '$n'" \
       && (( searched += 1 )) || failed=1
@@ -405,6 +413,7 @@ cmd_update() {
 # What each machine is for, shown in `box help`.
 describe() {
   if has_role $1 mac; then echo "Art's MacBook, the main machine. Art works here; be careful with it."
+  elif has_role $1 windows; then echo "Art's Windows PC; SSH only when it's on, no T3 or agents, skipped by \"all\" and syncs"
   elif has_role $1 proxy; then echo "agent box (Ubuntu), the default; holds the Claude accounts (CLIProxyAPI)"
   else echo "agent box (Ubuntu); Claude goes through skynet's proxy"; fi
 }
@@ -412,7 +421,7 @@ describe() {
 cmd_help() {
   local n
   cat <<EOF
-These are Art's machines. All of them can reach each other, and every one has this CLI:
+These are Art's machines. All of them can reach each other, and every one but the Windows PC has this CLI:
 
 EOF
   for n in $M_NAMES; do printf "  %-8s %s%s\n" $n "$(describe $n)" "$([[ $n == $SELF ]] && echo '  <- you are here')"; done
@@ -452,7 +461,7 @@ elif [[ -z $TARGET && ${args[1]} == all ]]; then ALL=1; args=("${args[@]:1}"); f
 case $cmd in proxy|p|proxy-close|claude-login|usage|u) TARGET=${TARGET:-$(machine_with_role proxy)} ;; esac
 TARGET=${TARGET:-$(machine_with_role default)}
 
-each() { if (( ALL )); then for TARGET in $M_NAMES; do "$@"; echo; done; else "$@"; fi; }
+each() { if (( ALL )); then for TARGET in $FLEET; do "$@"; echo; done; else "$@"; fi; }
 
 case $cmd in
   ssh|"") cmd_ssh ;;
