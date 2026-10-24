@@ -438,6 +438,29 @@ class WiringTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertFalse(module.heavy_bun(args))
 
+    def test_self_queued_scripts_bypass_the_launcher(self):
+        loader = importlib.machinery.SourceFileLoader("queue_self", str(QUEUE))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sub").mkdir()
+            (root / "package.json").write_text(json.dumps({"heavyCheck": {"selfQueued": ["check"]}}))
+            with contextlib.chdir(root / "sub"):
+                self.assertFalse(module.heavy_bun(["run", "check", "--only", "nosuch"]))
+                self.assertFalse(module.heavy_bun(["run", "check", "--bogus"]))
+                self.assertTrue(module.heavy_bun(["run", "typecheck"]))
+            other = root / "other"
+            other.mkdir()
+            (other / "package.json").write_text("{}")
+            with contextlib.chdir(other):
+                self.assertTrue(module.heavy_bun(["run", "check"]))
+                self.assertFalse(module.heavy_bun(["--cwd", str(root), "run", "check"]))
+            (other / "package.json").write_text("not json")
+            with contextlib.chdir(other):
+                self.assertTrue(module.heavy_bun(["run", "check"]))
+
     def test_wiring_preserves_commands_and_is_idempotent(self):
         loader = importlib.machinery.SourceFileLoader("wire", str(QUEUE.with_name("wire-heavy-checks")))
         spec = importlib.util.spec_from_loader(loader.name, loader)
