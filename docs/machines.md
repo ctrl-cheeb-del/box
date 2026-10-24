@@ -359,3 +359,6 @@ no Claude, no heartbeat, and `all`, `update`, `sync-memory`, `sync-skills` and `
   `C:\ProgramData\ssh\administrators_authorized_keys` (only Administrators and SYSTEM may have access),
   not `~\.ssh\authorized_keys`. The Mac's `art-macbook` key is in it.
 - Default SSH shell is Windows PowerShell (`HKLM:\SOFTWARE\OpenSSH\DefaultShell`).
+- Remote Desktop is on (Windows 11 Pro), with Network Level Authentication and the "Remote Desktop"
+  firewall group on every profile. `box desktop pc` opens it with FreeRDP; the password is Art's Windows
+  password, in the Mac Keychain item `box-rdp-pc` (account `art`).
