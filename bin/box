@@ -31,10 +31,13 @@ has_role() { [[ ",${M_ROLES[$1]}," == *",$2,"* ]]; }
 FLEET=(); for _n in $M_NAMES; do has_role $_n windows || FLEET+=($_n); done; unset _n
 machine_with_role() { local n; for n in $M_NAMES; do has_role $n $1 && { echo $n; return; }; done; }
 is_machine() { (( ${M_NAMES[(Ie)$1]} )); }
-# The machine this is running on: matched by hostname, or the "mac" role on macOS.
-if (( ON_MAC )); then SELF=$(machine_with_role mac); else SELF=${${(L)$(hostname -s)}}; is_machine $SELF || SELF=""; fi
+# Agent boxes that run macOS ("macbox"): launchd instead of systemd, no Ubuntu services.
+on_macos() { has_role $1 mac || has_role $1 macbox; }
+# The machine this is running on: matched by hostname, else the "mac" role on macOS.
+SELF=${${(L)$(hostname -s)}}
+is_machine $SELF || { (( ON_MAC )) && SELF=$(machine_with_role mac) || SELF=""; }
 # revnu2's Claude memory folder, relative to home; Claude names it after the checkout path.
-memory_dir() { has_role $1 mac && echo .claude/projects/-Users-art-Documents-projects-revnu2/memory/ \
+memory_dir() { on_macos $1 && echo .claude/projects/-Users-art-Documents-projects-revnu2/memory/ \
   || echo .claude/projects/-home-art-Documents-projects-revnu2/memory/; }
 
 TARGET=""
@@ -70,10 +73,10 @@ ont() { local h=$1; shift; [[ $h == self ]] && { bash -c "$*"; return; }; ssh -t
 
 run() { local h; h=$(resolve) || return 1; on "$h" "$@"; }
 
-# Commands that drive the Ubuntu services; the Mac has none of them.
+# Commands that drive an agent box's services; the Mac has none of them.
 need_box() {
-  has_role $TARGET mac && { say "is the Mac; \`box $1\` is for the Linux boxes"; return 1; }
-  has_role $TARGET windows && { say "is a Windows PC; \`box $1\` is for the Linux boxes"; return 1; }
+  has_role $TARGET mac && { say "is the Mac; \`box $1\` is for the agent boxes"; return 1; }
+  has_role $TARGET windows && { say "is a Windows PC; \`box $1\` is for the agent boxes"; return 1; }
   return 0
 }
 # Commands that open a window or the clipboard on this computer.
@@ -112,6 +115,11 @@ cmd_ssh() {
 cmd_desktop() {
   need_mac desktop || return 1
   has_role $TARGET windows || need_box desktop || return 1
+  # A macOS box: Screen Sharing (VNC), which asks for the login password and can keep it in Keychain.
+  if has_role $TARGET macbox; then
+    local h; h=$(resolve 5900) || return 1
+    open "vnc://${M_USER[$TARGET]}@$h"; say "opening Screen Sharing"; return
+  fi
   [[ $1 == --windows-app ]] && { cmd_desktop_windows_app; return; }
   local h pw user=${M_USER[$TARGET]} item=agentbox-rdp
   has_role $TARGET windows && item=box-rdp-$TARGET
@@ -193,6 +201,31 @@ echo "disk        $(df -h / | awk 'NR==2{print $3" used / "$2}')"
 EOF
     return
   fi
+  if has_role $TARGET macbox; then
+    # macOS ships bash 3.2: keep this script free of bash 4 features.
+    on "$h" 'bash -s' <<'EOF'
+ok() { [ "$1" = active ] && printf "\e[32m%s\e[0m" "$1" || printf "\e[31m%s\e[0m" "$1"; }
+echo "uptime      $(uptime | sed "s/.*up \([^,]*\),.*/\1/")"
+t3=$(launchctl print gui/$(id -u)/com.t3tools.t3code.service 2>/dev/null | awk '$1 == "state" {print $3; exit}')
+[ "$t3" = running ] && t3=active
+echo "t3 code     $(ok "${t3:-not installed}")"
+base=$(jq -r ".env.ANTHROPIC_BASE_URL // empty" ~/.claude/settings.json 2>/dev/null)
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$base/v1/models" -H "x-api-key: $(cat ~/.cli-proxy-api/proxy-key 2>/dev/null)")
+[ "$code" = 200 ] && st=active || st="unreachable ($code)"
+echo "claude via  $base $(ok "$st")"
+/Applications/Tailscale.app/Contents/MacOS/Tailscale status --self --peers=false >/dev/null 2>&1 && ts=active || ts=down
+echo "tailscale   $(ok $ts)"
+echo "t3 connect  $(t3 connect status 2>/dev/null | grep -E 'Exposure' | sed 's/.*: //')"
+pmset -g | grep -q 'SleepDisabled[[:space:]]*1' && sl=active || sl="sleep is ON"
+echo "never sleep $(ok "$sl")"
+echo "battery     $(pmset -g batt | grep -o "[0-9]*%.*;" | head -1)"
+free=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{print $2+0}')
+echo "memory      $((100 - ${free:-100}))% used of $(( $(sysctl -n hw.memsize) / 1073741824 )) GB (swap $(sysctl -n vm.swapusage | awk '{print $6" / "$3}'))"
+# "/" is the sealed system volume; files live on the Data volume.
+echo "disk        $(df -h /System/Volumes/Data | awk 'NR==2{print $3" used / "$2}')"
+EOF
+    return
+  fi
   on "$h" 'bash -s' <<'EOF'
 ok() { [ "$1" = active ] && printf "\e[32m%s\e[0m" "$1" || printf "\e[31m%s\e[0m" "$1"; }
 echo "uptime      $(uptime -p)"
@@ -233,7 +266,7 @@ cmd_reboot() {
   local h; h=$(resolve) || return 1
   [[ $h == self ]] && { say "is this machine; reboot it from another one"; return 1; }
   say "rebooting..."
-  on "$h" 'sudo systemctl reboot' 2>/dev/null
+  if has_role $TARGET macbox; then on "$h" 'sudo shutdown -r now' 2>/dev/null; else on "$h" 'sudo systemctl reboot' 2>/dev/null; fi
   sleep 20
   for _ in {1..40}; do reachable "$h" 22 && break; sleep 3; done
   sleep 15
@@ -243,6 +276,8 @@ cmd_reboot() {
 cmd_logs() {
   need_box logs || return 1
   local unit=${1:-t3code} h; h=$(resolve) || return 1
+  # launchd has no journal: the T3 service writes its own log file.
+  has_role $TARGET macbox && { ont "$h" 'tail -n 100 -f ~/.t3/userdata/logs/boot-service.log'; return; }
   ont "$h" "journalctl --user -u $unit -n 100 -f"
 }
 
@@ -279,13 +314,11 @@ cmd_sync_skills() {
     TARGET=$n; h=$(resolve 2>/dev/null) || { say "unreachable, skipped"; continue; }
     if [[ -r $d/sync-skills ]]; then
       on "$h" 'mkdir -p ~/.local/bin && cat > ~/.local/bin/sync-skills && chmod +x ~/.local/bin/sync-skills' < "$d/sync-skills" || continue
-      if has_role $n mac; then
-        if [[ $h == self ]]; then
-          local plist=~/Library/LaunchAgents/com.box.sync-skills.plist
-          cmp -s "$BOX_REPO/mac/com.box.sync-skills.plist" $plist || {
-            cp "$BOX_REPO/mac/com.box.sync-skills.plist" $plist
-            launchctl bootout gui/$(id -u) $plist 2>/dev/null; launchctl bootstrap gui/$(id -u) $plist; }
-        fi
+      if on_macos $n; then
+        on "$h" 'p=~/Library/LaunchAgents/com.box.sync-skills.plist; t=$(mktemp); cat > "$t"
+          if cmp -s "$t" "$p"; then rm "$t"; else mv "$t" "$p"
+            launchctl bootout gui/$(id -u) "$p" 2>/dev/null; launchctl bootstrap gui/$(id -u) "$p"; fi' \
+          < "$BOX_REPO/mac/com.box.sync-skills.plist"
       else
         on "$h" 'mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/sync-skills.service' < "$d/sync-skills.service"
         on "$h" 'cat > ~/.config/systemd/user/sync-skills.timer && systemctl --user daemon-reload && systemctl --user enable -q --now sync-skills.timer' < "$d/sync-skills.timer"
@@ -411,6 +444,8 @@ PY
 cmd_update() {
   need_box update || return 1
   local h; h=$(resolve) || return 1
+  # macOS box: no apt; Codex is an npm global there, and `t3 update` restarts its own launchd service.
+  has_role $TARGET macbox && { ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; t3 update --yes; claude update; npm i -g @openai/codex@latest; bun upgrade; if [ -x "$HOME/.local/bin/install-heavy-checks" ]; then "$HOME/.local/bin/install-heavy-checks"; fi'; return; }
   ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade; if [ -x \"\$HOME/.local/bin/install-heavy-checks\" ]; then \"\$HOME/.local/bin/install-heavy-checks\"; fi" && systemctl --user restart t3code'
 }
 
@@ -419,6 +454,7 @@ describe() {
   if has_role $1 mac; then echo "Art's MacBook, the main machine. Art works here; be careful with it."
   elif has_role $1 windows; then echo "Art's Windows PC; SSH only when it's on, no T3 or agents, skipped by \"all\" and syncs"
   elif has_role $1 proxy; then echo "agent box (Ubuntu), the default; holds the Claude accounts (CLIProxyAPI)"
+  elif has_role $1 macbox; then echo "agent box (macOS); Claude goes through skynet's proxy"
   else echo "agent box (Ubuntu); Claude goes through skynet's proxy"; fi
 }
 
@@ -441,14 +477,14 @@ Commands ([machine] defaults to $(machine_with_role default); "all" means every 
   box list                      every machine and whether it's reachable right now
   box status [machine|all]      health check: services, Claude, browser sandbox, battery, disk
   box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
-  box update [machine|all]      update Ubuntu, T3 Code, Claude Code, Codex, bun, and this CLI
+  box update [machine|all]      update Ubuntu (not macOS), T3 Code, Claude Code, Codex, bun, and this CLI
   box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
   box threads search <query>    search T3 titles, messages and Claude transcripts on every machine
   box sync-memory               two-way sync of revnu2 Claude memories with every machine
   box sync-skills               install bot-loop from revnu2 main on every machine (also runs hourly)
   box usage                     5-hour and weekly use per Claude account
   box claude-login              add or re-auth a Claude account in the proxy (needs Art in a browser)
-  box desktop [machine]         a box's Ubuntu desktop, or the Windows PC's screen (Mac only)
+  box desktop [machine]         a box's desktop (RDP, or Screen Sharing on air), or the Windows PC's screen (Mac only)
   box proxy | proxy-close       CLIProxyAPI dashboard (Mac only)
 
 Machines are listed in ${MACHINES_FILE:A}. Full notes: ${MACHINES_FILE:A:h}/docs/machines.md
