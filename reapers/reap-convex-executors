@@ -1,11 +1,19 @@
 #!/bin/sh
-# Kill Convex local executors (node /tmp/.tmpX/local.cjs) whose convex-local-backend has exited.
+# Kill Convex local executors (node <tmp>/.tmpX/local.cjs) whose convex-local-backend has exited.
 # The backend does not stop its executor on shutdown; an orphan can never serve anything again.
+# The temp dir is /tmp on Linux and $TMPDIR (/var/folders/.../T) on macOS.
+set -f
 for pid in $(pgrep -x node); do
-  dir=$(tr "\0" "\n" < /proc/$pid/cmdline 2>/dev/null | sed -n "2s#^\(/tmp/\.tmp[A-Za-z0-9]*\)/local\.cjs\$#\1#p")
-  [ -n "$dir" ] || continue
+  # shellcheck disable=SC2046
+  set -- $(ps -o args= -p "$pid" 2>/dev/null)
+  case "${2:-}" in
+    /tmp/.tmp*/local.cjs|/private/tmp/.tmp*/local.cjs|/var/folders/*/T/.tmp*/local.cjs) dir=${2%/local.cjs} ;;
+    *) continue ;;
+  esac
+  case "$dir" in */.tmp*/*) continue ;; esac
   ppid=$(ps -o ppid= -p "$pid" | tr -d " ")
-  case "$(ps -o comm= -p "$ppid")" in convex-local-ba*) continue ;; esac
+  # Linux truncates comm to 15 characters; macOS prints the full path.
+  case "$(ps -o comm= -p "$ppid")" in *convex-local-ba*) continue ;; esac
   kill "$pid" 2>/dev/null && echo "reaped executor $pid $dir"
   [ -O "$dir" ] && rm -rf "$dir"
 done

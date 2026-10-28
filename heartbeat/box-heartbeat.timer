@@ -2,7 +2,10 @@
 Description=box heartbeat every 30 minutes
 
 [Timer]
-OnBootSec=2min
+# Counted from when the user manager starts, not from boot: after a restart of the user manager
+# (jarvis, 2026-10-15) OnBootSec had long passed and OnUnitActiveSec had no run to count from,
+# so the timer sat "elapsed" for two weeks.
+OnStartupSec=2min
 OnUnitActiveSec=30min
 Persistent=true
 

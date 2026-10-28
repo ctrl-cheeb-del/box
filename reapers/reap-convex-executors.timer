@@ -1,7 +1,10 @@
 [Unit]
 Description=Reap orphaned Convex local executors every 10 minutes
 [Timer]
-OnBootSec=5min
+# Counted from when the user manager starts, not from boot: after a restart of the user manager
+# (jarvis, 2026-10-15) OnBootSec had long passed and OnUnitActiveSec had no run to count from,
+# so the timer sat "elapsed" for two weeks.
+OnStartupSec=5min
 OnUnitActiveSec=10min
 [Install]
 WantedBy=timers.target

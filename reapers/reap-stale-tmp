@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Reap our /tmp entries untouched for two days, unless a process still uses them.
-# Usage: reap-stale-tmp [--dry-run]. Linux only; never follows symlinks or crosses mounts.
+# Usage: reap-stale-tmp [--dry-run]. Linux and macOS; never follows symlinks or crosses mounts.
+# On macOS it also cleans the per-user $TMPDIR (/var/folders/.../T), where most temp files land.
 import argparse
 import fcntl
 import json
@@ -11,7 +12,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+
+LINUX = sys.platform.startswith("linux")
+MACOS = sys.platform == "darwin"
+# Walking a tree must not make it look recently used. Linux needs O_NOATIME for that; APFS on
+# macOS does not update atime on reads at all (checked on macOS 26), so there is no flag to pass.
+O_NOATIME = getattr(os, "O_NOATIME", 0)
 
 # Run just this read-only /proc scan with sudo -n if procfs hides another user's handles.
 # Never elevate the deletion code. A failed/incomplete scan means nothing is removed.
@@ -39,7 +47,27 @@ print(json.dumps({'refs': sorted(refs), 'denied': denied}))
 '''
 
 
+def lsof_refs():
+    # macOS has no /proc. lsof run as the user silently skips other users' processes, so only a
+    # root scan is complete; without passwordless sudo nothing is removed.
+    result = subprocess.run(["sudo", "-n", "lsof", "-w", "-n", "-P", "-F", "Di"],
+                            capture_output=True, text=True, timeout=120)
+    if not result.stdout:
+        raise RuntimeError("cannot inspect live processes: " + (result.stderr.strip() or "lsof printed nothing"))
+    refs, device = set(), None
+    for line in result.stdout.splitlines():
+        if line[:1] in ("p", "f"):
+            device = None
+        elif line[:1] == "D":
+            device = int(line[1:], 16)
+        elif line[:1] == "i" and device is not None:
+            refs.add((device, int(line[1:])))
+    return refs
+
+
 def open_refs():
+    if MACOS:
+        return lsof_refs()
     command = [sys.executable, "-c", PROC_SCAN]
     result = json.loads(subprocess.check_output(command, text=True, timeout=30))
     if result["denied"]:
@@ -50,18 +78,34 @@ def open_refs():
 
 
 def protected(name):
-    return name.startswith(("tmux", "ssh-", ".ssh", "systemd", ".systemd", "X11", ".X11", ".ICE"))
+    return name.startswith(("tmux", "ssh-", ".ssh", "systemd", ".systemd", "X11", ".X11", ".ICE",
+                            # macOS's own entries in /private/tmp and $TMPDIR
+                            "com.apple.", "TemporaryItems", "launchd", "xcrun_db", "powerlog"))
 
 
 def mounted_paths(root):
     # st_dev alone misses bind mounts on the same filesystem.
     mounts = set()
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
-        name = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+    if MACOS:
+        # `mount` prints "<device> on <path> (<options>)"
+        names = [m[1] for m in (re.match(r".+? on (.+) \(", line)
+                                for line in subprocess.check_output(["mount"], text=True).splitlines()) if m]
+    else:
+        names = [re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), line.split()[4])
+                 for line in Path("/proc/self/mountinfo").read_text().splitlines()]
+    for name in names:
         mount = Path(name)
         if mount == root or root in mount.parents:
             mounts.add(mount)
     return mounts
+
+
+def default_roots():
+    if not MACOS:
+        return [Path("/tmp")]
+    user_tmp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
+    roots = [Path("/private/tmp"), Path(user_tmp or tempfile.gettempdir()).resolve()]
+    return list(dict.fromkeys(roots))
 
 
 def old_tree(path, uid, device, cutoff, mounts=()):
@@ -86,7 +130,7 @@ def old_tree(path, uid, device, cutoff, mounts=()):
         if stat.S_ISDIR(s.st_mode) or s.st_nlink == 1:
             allocated += s.st_blocks * 512
         if stat.S_ISDIR(s.st_mode):
-            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME,
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | O_NOATIME,
                          dir_fd=parent_fd)
             try:
                 opened = os.fstat(fd)
@@ -110,13 +154,13 @@ def old_tree(path, uid, device, cutoff, mounts=()):
 SHOWN = 20
 
 
-def main(argv=None, root=Path("/tmp")):
+def main(argv=None, root=None):
     parser = argparse.ArgumentParser(description=__doc__ or "Reap unused /tmp trees older than two days.")
     parser.add_argument("--dry-run", action="store_true", help="list candidates without deleting anything")
     parser.add_argument("--list", action="store_true", help=f"print every entry, not just the {SHOWN} largest")
     args = parser.parse_args(argv)
-    if not sys.platform.startswith("linux") or not hasattr(os, "O_NOATIME"):
-        parser.error("Linux /proc and O_NOATIME are required")
+    if not (LINUX and hasattr(os, "O_NOATIME")) and not MACOS:
+        parser.error("Linux (/proc and O_NOATIME) or macOS is required")
     if os.geteuid() == 0:
         parser.error("run as the user whose /tmp entries should be cleaned, without sudo")
     if not shutil.rmtree.avoids_symlink_attacks:
@@ -132,16 +176,17 @@ def main(argv=None, root=Path("/tmp")):
             print("another reap-stale-tmp is running, skipped")
             return 0
         cutoff = time.time() - 2 * 86400
-        device = root.stat().st_dev
-        mounts = mounted_paths(root)
         candidates = []
-        with os.scandir(root) as entries:
-            for entry in entries:
-                if protected(entry.name):
-                    continue
-                tree = old_tree(Path(entry.path), uid, device, cutoff, mounts)
-                if tree is not None:
-                    candidates.append((Path(entry.path), tree))
+        for top in [root] if root else default_roots():
+            device = top.stat().st_dev
+            mounts = mounted_paths(top)
+            with os.scandir(top) as entries:
+                for entry in entries:
+                    if protected(entry.name):
+                        continue
+                    tree = old_tree(Path(entry.path), uid, device, cutoff, mounts)
+                    if tree is not None:
+                        candidates.append((Path(entry.path), tree, device, mounts))
         try:
             refs = open_refs() if candidates else set()
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -151,7 +196,7 @@ def main(argv=None, root=Path("/tmp")):
         # journald's rate limit and dropped the summary. Print the largest few unless --list.
         removed, freed, busy, changed, failed = 0, 0, 0, 0, 0
         done = []
-        for path, tree in candidates:
+        for path, tree, device, mounts in candidates:
             nodes, allocated = tree
             if nodes.keys() & refs:
                 busy += 1

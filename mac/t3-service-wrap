@@ -1,0 +1,23 @@
+#!/bin/bash
+# Keep the T3 service on a macOS box starting through box-launch (see box-launch.c for why).
+# `t3 service install` and `t3 update` rewrite the service plist with the new versioned binary
+# first, which would bring the ~/Documents privacy prompt back. launchd runs this whenever that
+# plist changes (com.box.t3-service-wrap.plist, WatchPaths) and at login.
+set -u
+P="$HOME/Library/LaunchAgents/com.t3tools.t3code.service.plist"
+W="$HOME/.local/libexec/box-launch"
+LABEL="gui/$(id -u)/com.t3tools.t3code.service"
+[ -f "$P" ] && [ -x "$W" ] || exit 0
+first() { plutil -extract ProgramArguments.0 raw -o - "$P" 2>/dev/null; }
+[ "$(first)" = "$W" ] && exit 0
+
+# `t3 update` restarts the service itself right after writing the plist; let it finish.
+sleep 10
+[ "$(first)" = "$W" ] && exit 0
+plutil -insert ProgramArguments.0 -string "$W" "$P" || exit 1
+launchctl bootout "$LABEL" 2>/dev/null
+for _ in $(seq 30); do
+  launchctl bootstrap "gui/$(id -u)" "$P" 2>/dev/null && break
+  sleep 2   # bootout returns before the old process has exited
+done
+echo "$(date '+%F %T') T3 service now starts through box-launch ($(plutil -extract ProgramArguments.1 raw -o - "$P"))"
