@@ -391,13 +391,24 @@ agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sh
   config: `~/.claude/settings.json.bak-pre-air-setup`, `~/.claude.json.bak-pre-air-setup`.
 - **Codex**: ChatGPT login art@freebrey.com (Pro), the same account as the other machines (it was art@revnu.app before).
 - **Keychain trap**: SSH sessions on macOS can't read the login Keychain ("User interaction is not allowed"), even
-  though auto-login unlocks it for the GUI session where T3 and its agents run. So `gh` uses file storage
-  (`--insecure-storage`, `~/.config/gh/hosts.yml`) and works over SSH too, while Doppler's login stays in the Keychain:
-  it works for agents but not in a plain SSH shell. To run something in the GUI session from SSH:
-  `~/.local/state/air-setup/gui-run "<command>"` (a one-shot launch agent).
+  though auto-login unlocks it for the GUI session where T3 and its agents run. CLIs that keep their login there break
+  over SSH. So both moved to file storage: `gh` (`--insecure-storage`, `~/.config/gh/hosts.yml`) and Doppler (token in
+  `~/.doppler/.doppler.yaml`; the Keychain-backed original is `.doppler.yaml.bak-keyring`). Doppler reads every
+  Keychain reference in its config at startup, so even `DOPPLER_TOKEN` fails while one is left. To run something in
+  the GUI session from SSH: `~/.local/state/air-setup/gui-run "<command>"` (a one-shot launch agent).
+- **`~/Documents` privacy trap (TCC)**: a process started by launchd needs permission to read `~/Documents`, and macOS
+  asks in a dialog on the Air's screen; until someone clicks, the process blocks in `getcwd`/`open` with no output.
+  SSH is exempt. The T3 binary has the grant (System Settings -> Privacy & Security -> Files and Folders), and agents
+  T3 starts inherit it, but macOS recorded it by path (`~/.t3/runtime/versions/<version>/t3`): **after `t3 update`,
+  check `box desktop air` for a new "t3 would like to access files in your Documents folder" prompt**, or agents hang
+  in revnu2. `gui-run` jobs run as `/bin/zsh` and have no grant, so don't point them at `~/Documents`.
 - **revnu2**: the existing full clone at `~/Documents/projects/revnu2`, switched to `main` (the old
   `revnu2-workflows-public` worktree, which held `main`, is now detached at the same commit). Doppler `revnu2/dev`,
-  `bun setup`.
+  `bun setup` green with bun 1.4.2 (pinned in `.bun-version`; `bun upgrade` overshoots, so install the exact version
+  with `curl -fsSL https://bun.sh/install | bash -s bun-v<version>`) and gh 2.103 (Homebrew). Verified 2026-10-28 in
+  a throwaway worktree: `bun dev --worktree` ready in 60 s, `bun e2e` PASS, `bun screenshot /dashboard/leads`
+  renders, `bun errors --prod` reads. Heavy-check queue installed (`bin/install-heavy-checks`), and `sync-skills`
+  runs hourly from `~/Library/LaunchAgents/com.box.sync-skills.plist`.
 - **Screen Sharing** is on (`com.apple.screensharing`); `box desktop air` opens `vnc://art@<host>` in Screen Sharing.
 - **Fleet**: its existing key (`~/.ssh/id_ed25519`, listed as `art@air fleet`) is on skynet, jarvis and the Mac;
   theirs are on it; all have `air` / `skynet` / `jarvis` / `mac` SSH aliases.
