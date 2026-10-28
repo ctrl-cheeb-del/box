@@ -409,6 +409,20 @@ agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sh
   a throwaway worktree: `bun dev --worktree` ready in 60 s, `bun e2e` PASS, `bun screenshot /dashboard/leads`
   renders, `bun errors --prod` reads. Heavy-check queue installed (`bin/install-heavy-checks`), and `sync-skills`
   runs hourly from `~/Library/LaunchAgents/com.box.sync-skills.plist`.
+- **Parity with skynet (2026-10-28)**, from what skynet's agents used in the last 30 days (2,600 transcripts:
+  Linear MCP ~2,000 calls, Slack ~290, Cloudflare 26, revnu 21, GSC 6; skills linear-ticket, bot-loop, fullsend,
+  debrief; `bun ops/investigate/errors/screenshot/stack/linear`, `gh`, SSH to jarvis, AWS EC2 for revbox):
+  - MCP: `linear-server` added (the Mac's MCP list, which the Air started from, has no Linear), `cloudflare-api` moved
+    to `--transport http`, the `aws-startup-advisor` plugin installed, Vercel re-enabled for revnu2. Signed in on 2026-10-28
+    (at the Air's screen: `~/Desktop/mcp-login.command` opens `claude` in revnu2, then `/mcp`): Slack, Linear and
+    Cloudflare; Replicate, GSC and AWS also connect. Still unauthenticated, as on skynet: the Vercel MCP and revnu.
+    The OAuth tokens live in the Keychain, so `claude mcp list` over plain SSH reports them as failing; check from
+    the GUI session instead: `~/.local/state/air-setup/gui-run "cd ~; claude mcp list"`.
+  - Skills: skynet's extra global skills (pstack / principle-* and others) copied, so `~/.claude/skills` is a superset.
+  - AWS CLI v2 (the official pkg in `/usr/local/bin`; Homebrew's awscli needs a newer macOS libexpat) with skynet's
+    `revbox-test` credentials in `~/.aws`, and `~/.ssh/revbox-fleet.pem` + `revbox-fleet.known` for the EC2 hosts.
+  - Vercel CLI logged in as ctrl-cheeb-del (device flow). wrangler is logged out here, as on skynet.
+  - Not copied: pokeheartgold (skynet-only, Linux toolchain and 7 GB of git-ignored tools) and the scratch-only `kagu` MCP.
 - **Screen Sharing** is on (`com.apple.screensharing`); `box desktop air` opens `vnc://art@<host>` in Screen Sharing.
 - **Fleet**: its existing key (`~/.ssh/id_ed25519`, listed as `art@air fleet`) is on skynet, jarvis and the Mac;
   theirs are on it; all have `air` / `skynet` / `jarvis` / `mac` SSH aliases.
