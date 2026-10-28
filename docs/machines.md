@@ -398,10 +398,16 @@ agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sh
   the GUI session from SSH: `~/.local/state/air-setup/gui-run "<command>"` (a one-shot launch agent).
 - **`~/Documents` privacy trap (TCC)**: a process started by launchd needs permission to read `~/Documents`, and macOS
   asks in a dialog on the Air's screen; until someone clicks, the process blocks in `getcwd`/`open` with no output.
-  SSH is exempt. The T3 binary has the grant (System Settings -> Privacy & Security -> Files and Folders), and agents
-  T3 starts inherit it, but macOS recorded it by path (`~/.t3/runtime/versions/<version>/t3`): **after `t3 update`,
-  check `box desktop air` for a new "t3 would like to access files in your Documents folder" prompt**, or agents hang
-  in revnu2. `gui-run` jobs run as `/bin/zsh` and have no grant, so don't point them at `~/Documents`.
+  SSH is exempt. macOS asks about the binary launchd started and records the answer by path, and the T3 service
+  binary moves to `~/.t3/runtime/versions/<version>/t3` on every update, so each update used to raise a new prompt.
+  Fixed 2026-10-28 with `mac/box-launch.c`: launchd starts `~/.local/libexec/box-launch`, which runs T3 (and the
+  heartbeat and reapers) as its child, so everything is attributed to that one fixed path. It holds the grant
+  (`kTCCServiceSystemPolicyDocumentsFolder`, allowed 2026-10-28). `com.box.t3-service-wrap` watches the T3 service
+  plist and puts box-launch back in front whenever `t3 service install`/`t3 update` rewrites it (tested: wrapped
+  again within 30 s, T3 back up). `t3 service status` then says "needs an update or repair"; that's expected and
+  harmless. Don't rebuild box-launch (`install-macbox` only builds it when missing): a new signature means a new
+  prompt. `box status air` shows "t3 wrapped" and "~/Documents" (blocked if the heartbeat's probe hangs).
+  `gui-run` jobs run as `/bin/zsh` and have no grant, so don't point them at `~/Documents`.
 - **revnu2**: the existing full clone at `~/Documents/projects/revnu2`, switched to `main` (the old
   `revnu2-workflows-public` worktree, which held `main`, is now detached at the same commit). Doppler `revnu2/dev`,
   `bun setup` green with bun 1.4.2 (pinned in `.bun-version`; `bun upgrade` overshoots, so install the exact version
@@ -426,5 +432,23 @@ agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sh
 - **Screen Sharing** is on (`com.apple.screensharing`); `box desktop air` opens `vnc://art@<host>` in Screen Sharing.
 - **Fleet**: its existing key (`~/.ssh/id_ed25519`, listed as `art@air fleet`) is on skynet, jarvis and the Mac;
   theirs are on it; all have `air` / `skynet` / `jarvis` / `mac` SSH aliases.
-- **Not on air (Linux-only for now)**: the heartbeat (uses `/proc`, `free`, systemd and bash 4), the reaper timers
-  (`/proc`), zram. macOS compresses memory itself.
+- **Heartbeat and reapers** (2026-10-28): the same scripts as the Linux boxes, now portable, run as launchd agents
+  through box-launch, installed by `mac/install-macbox` (also run by `box update air`): `com.box.heartbeat` (30 min;
+  Homebrew bash 5 for its associative arrays), `com.box.reap-convex-executors` (10 min), `com.box.reap-idle-dev-stacks`
+  (30 min), `com.box.reap-stale-tmp` (hourly; `/private/tmp` and the per-user `$TMPDIR`, open files via `sudo -n
+  lsof`). Logs in `~/Library/Logs/box/` (`box logs air heartbeat`). The heartbeat on a Mac also alerts when sleep is back
+  on or `~/Documents` is blocked by a privacy prompt. `~/.config/box/peers` is skynet + jarvis, and both list `air`.
+  No zram: macOS compresses memory itself.
+
+## Stuck timers on the Linux boxes (found 2026-10-28)
+
+Setting up air's heartbeat showed jarvis had posted nothing since 2026-10-15. Two separate faults:
+- **Timers that never fire again after a user-manager restart.** All the user timers used `OnBootSec` +
+  `OnUnitActiveSec`. When jarvis's user manager restarted after the 2026-10-15 outage, boot was long past and the
+  service had never run in the new manager, so `box-heartbeat.timer` sat "active (elapsed)" with no next run for two
+  weeks. Every timer now uses `OnStartupSec` (counted from the user manager's start, which at boot is the same moment).
+- **`reap-idle-dev-stacks` looping forever.** A process that exited between `pgrep` and reading its cwd gave an
+  empty cwd, and `dirname ""` is `.`, so the walk up to `/` never ended. The run stayed "activating" (skynet 10 hours,
+  jarvis since 2026-10-23), so the timer never fired again and orphaned stacks piled up; the first fixed run killed five
+  orphans on each box. It now skips any cwd that isn't an absolute path.
+Check with `systemctl --user list-timers`: a box timer with `-` in NEXT is stuck.

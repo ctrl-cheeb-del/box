@@ -218,6 +218,14 @@ echo "tailscale   $(ok $ts)"
 echo "t3 connect  $(t3 connect status 2>/dev/null | grep -E 'Exposure' | sed 's/.*: //')"
 pmset -g | grep -q 'SleepDisabled[[:space:]]*1' && sl=active || sl="sleep is ON"
 echo "never sleep $(ok "$sl")"
+jobs=$(launchctl list | grep -c -E 'com\.box\.(t3-service-wrap|reap-convex-executors|reap-idle-dev-stacks|reap-stale-tmp|heartbeat)$')
+[ "$jobs" = 5 ] && js=active || js="$jobs/5 loaded (run mac/install-macbox)"
+echo "box jobs    $(ok "$js")"
+[ "$(plutil -extract ProgramArguments.0 raw -o - ~/Library/LaunchAgents/com.t3tools.t3code.service.plist 2>/dev/null)" = "$HOME/.local/libexec/box-launch" ] && w=active || w="not wrapped: ~/Documents prompts return"
+echo "t3 wrapped  $(ok "$w")"
+# The heartbeat probes ~/Documents through box-launch every 30 min; SSH itself is exempt from the prompt.
+grep -qx docs ~/.config/box/alerts 2>/dev/null && d="BLOCKED: click Allow in box desktop" || d=active
+echo "~/Documents $(ok "$d")"
 echo "battery     $(pmset -g batt | grep -o "[0-9]*%.*;" | head -1)"
 free=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{print $2+0}')
 echo "memory      $((100 - ${free:-100}))% used of $(( $(sysctl -n hw.memsize) / 1073741824 )) GB (swap $(sysctl -n vm.swapusage | awk '{print $6" / "$3}'))"
@@ -276,8 +284,14 @@ cmd_reboot() {
 cmd_logs() {
   need_box logs || return 1
   local unit=${1:-t3code} h; h=$(resolve) || return 1
-  # launchd has no journal: the T3 service writes its own log file.
-  has_role $TARGET macbox && { ont "$h" 'tail -n 100 -f ~/.t3/userdata/logs/boot-service.log'; return; }
+  # launchd has no journal: the T3 service writes its own log file, the box jobs ~/Library/Logs/box.
+  if has_role $TARGET macbox; then
+    case $unit in
+      t3code) ont "$h" 'tail -n 100 -f ~/.t3/userdata/logs/boot-service.log' ;;
+      *) ont "$h" "tail -n 100 -f ~/Library/Logs/box/${unit#box-}.log" ;;
+    esac
+    return
+  fi
   ont "$h" "journalctl --user -u $unit -n 100 -f"
 }
 
@@ -444,8 +458,10 @@ PY
 cmd_update() {
   need_box update || return 1
   local h; h=$(resolve) || return 1
-  # macOS box: no apt; Codex is an npm global there, and `t3 update` restarts its own launchd service.
-  has_role $TARGET macbox && { ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; t3 update --yes; claude update; npm i -g @openai/codex@latest; bun upgrade; if [ -x "$HOME/.local/bin/install-heavy-checks" ]; then "$HOME/.local/bin/install-heavy-checks"; fi'; return; }
+  # macOS box: no apt; Codex is an npm global there, and `t3 update` restarts its own launchd service
+  # (com.box.t3-service-wrap then puts box-launch back in front of it). install-macbox refreshes the
+  # heartbeat and reapers.
+  has_role $TARGET macbox && { ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; t3 update --yes; claude update; npm i -g @openai/codex@latest; bun upgrade; if [ -x "$HOME/.local/bin/install-heavy-checks" ]; then "$HOME/.local/bin/install-heavy-checks"; fi; ~/Documents/projects/box/mac/install-macbox'; return; }
   ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade; if [ -x \"\$HOME/.local/bin/install-heavy-checks\" ]; then \"\$HOME/.local/bin/install-heavy-checks\"; fi" && systemctl --user restart t3code'
 }
 
@@ -476,7 +492,7 @@ Reach any machine from any other, home network first and Tailscale otherwise:
 Commands ([machine] defaults to $(machine_with_role default); "all" means every machine):
   box list                      every machine and whether it's reachable right now
   box status [machine|all]      health check: services, Claude, browser sandbox, battery, disk
-  box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop
+  box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop, reapers/heartbeat
   box update [machine|all]      update Ubuntu (not macOS), T3 Code, Claude Code, Codex, bun, and this CLI
   box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
   box threads search <query>    search T3 titles, messages and Claude transcripts on every machine

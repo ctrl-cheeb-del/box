@@ -1,0 +1,76 @@
+#!/bin/bash
+# Install the health jobs on a macOS agent box (role "macbox" in ../machines): the same heartbeat and
+# reapers the Linux boxes run from systemd timers, as launchd agents, plus box-launch and the watcher
+# that keeps the T3 service starting through it. Idempotent; `box update <macbox>` runs it.
+# Usage: mac/install-macbox   (run on the box, from a clone of this repo)
+set -euo pipefail
+[ "$(uname)" = Darwin ] || { echo "install-macbox: macOS only" >&2; exit 1; }
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+BIN=$HOME/.local/bin LIBEXEC=$HOME/.local/libexec AGENTS=$HOME/Library/LaunchAgents LOGS=$HOME/Library/Logs/box
+mkdir -p "$BIN" "$LIBEXEC" "$AGENTS" "$LOGS" "$HOME/.config/box"
+
+# box-launch: built once. Rebuilding changes its signature, and macOS would ask for the
+# ~/Documents grant again, which is the prompt this whole setup exists to avoid.
+if [ ! -x "$LIBEXEC/box-launch" ]; then
+  clang -O2 -Wall -o "$LIBEXEC/box-launch" "$REPO/mac/box-launch.c"
+  echo "built $LIBEXEC/box-launch: allow its ~/Documents prompt once on this Mac's screen"
+fi
+
+# The heartbeat needs bash 4; macOS ships 3.2.
+[ -x /opt/homebrew/bin/bash ] || brew install -q bash
+
+for f in reapers/reap-convex-executors reapers/reap-idle-dev-stacks reapers/reap-stale-tmp \
+         heartbeat/box-heartbeat mac/t3-service-wrap; do
+  install -m 755 "$REPO/$f" "$BIN/"
+done
+
+PATH_JOBS="/opt/homebrew/bin:$HOME/.local/bin:$HOME/.bun/bin:$HOME/.nvm/versions/node/$(node -v 2>/dev/null || echo none)/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# job <name> <interval seconds | watch:<path>> <command> [args...]
+# Interval jobs run through box-launch so they share T3's ~/Documents grant.
+job() {
+  local name=$1 when=$2; shift 2
+  local plist="$AGENTS/com.box.$name.plist" tmp args="" a
+  if [[ $when == watch:* ]]; then
+    trigger="<key>WatchPaths</key><array><string>${when#watch:}</string></array>"
+  else
+    trigger="<key>StartInterval</key><integer>$when</integer>"
+    set -- "$LIBEXEC/box-launch" "$@"
+  fi
+  for a in "$@"; do args+="<string>$a</string>"; done
+  tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by box mac/install-macbox; edit that, not this. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.box.$name</string>
+  <key>ProgramArguments</key><array>$args</array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$PATH_JOBS</string></dict>
+  $trigger
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOGS/$name.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/$name.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint -s "$tmp"
+  if cmp -s "$tmp" "$plist" && launchctl print "gui/$(id -u)/com.box.$name" >/dev/null 2>&1; then
+    rm "$tmp"; return
+  fi
+  mv "$tmp" "$plist"
+  launchctl bootout "gui/$(id -u)/com.box.$name" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  echo "loaded com.box.$name"
+}
+
+job t3-service-wrap "watch:$AGENTS/com.t3tools.t3code.service.plist" "$BIN/t3-service-wrap"
+job reap-convex-executors 600 "$BIN/reap-convex-executors"
+job reap-idle-dev-stacks 1800 "$BIN/reap-idle-dev-stacks"
+job reap-stale-tmp 3600 "$BIN/reap-stale-tmp"
+job heartbeat 1800 "$BIN/box-heartbeat"
+
+[ -s "$HOME/.config/box/ntfy-topic" ] || echo "heartbeat: copy ~/.config/box/ntfy-topic from another box (it's the only secret)"
+[ -s "$HOME/.config/box/peers" ] || echo "heartbeat: write ~/.config/box/peers (the other boxes' hostnames, one per line)"
+echo "logs: $LOGS"

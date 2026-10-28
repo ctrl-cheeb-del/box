@@ -1,9 +1,11 @@
-#!/bin/bash
-# Every 30 min (box-heartbeat.timer): post an "alive" message to <topic>-hb (which no phone
-# subscribes to), then check the other boxes' heartbeats there and this box's own health.
-# Problems go to <topic> itself, once when they start and once when they clear.
+#!/usr/bin/env bash
+# Every 30 min (box-heartbeat.timer; launchd com.box.heartbeat on a macOS box): post an "alive"
+# message to <topic>-hb (which no phone subscribes to), then check the other boxes' heartbeats
+# there and this box's own health. Problems go to <topic> itself, once when they start and once
+# when they clear.
 # Config, never committed: ~/.config/box/ntfy-topic (the topic name is the only secret)
 # and ~/.config/box/peers (one box hostname per line).
+# Needs bash 4 (associative arrays): on macOS that's Homebrew's bash, first on the job's PATH.
 set -u
 CONF=~/.config/box
 TOPIC=$(cat "$CONF/ntfy-topic") || exit 1
@@ -15,10 +17,20 @@ STATE="$CONF/alerts"; touch "$STATE"
 
 push() { curl -s -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "${5:-$URL}"; }
 
-mem=$(free | awk '/Mem/{printf "%d", $3*100/$2}')
-disk=$(df / | awk 'NR==2{print $5+0}')
-load=$(cut -d" " -f1 /proc/loadavg)
-up=$(uptime -p | sed 's/^up //')
+MACOS=0; [ "$(uname)" = Darwin ] && MACOS=1
+if [ $MACOS = 1 ]; then
+  free_pct=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/{print $2+0}')
+  mem=$((100 - ${free_pct:-100}))
+  # "/" is the sealed system volume; files live on the Data volume.
+  disk=$(df /System/Volumes/Data | awk 'NR==2{print $5+0}')
+  load=$(sysctl -n vm.loadavg | awk '{print $2}')
+  up=$(uptime | sed 's/.*up \([^,]*\),.*/\1/')
+else
+  mem=$(free | awk '/Mem/{printf "%d", $3*100/$2}')
+  disk=$(df / | awk 'NR==2{print $5+0}')
+  load=$(cut -d" " -f1 /proc/loadavg)
+  up=$(uptime -p | sed 's/^up //')
+fi
 claude=ok
 if [ -f ~/.cli-proxy-api/management-key ]; then
   systemctl --user is-active -q cliproxyapi || claude="proxy down"
@@ -27,7 +39,12 @@ else
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$base/v1/models" -H "x-api-key: $(cat ~/.cli-proxy-api/proxy-key 2>/dev/null)")
   [ "$code" = 200 ] || claude="can't reach proxy ($code)"
 fi
-t3=$(systemctl --user is-active t3code)
+if [ $MACOS = 1 ]; then
+  t3=$(launchctl print "gui/$(id -u)/com.t3tools.t3code.service" 2>/dev/null | awk '$1 == "state" {print $3; exit}')
+  [ "$t3" = running ] && t3=active; t3=${t3:-not loaded}
+else
+  t3=$(systemctl --user is-active t3code)
+fi
 
 push "$ME" min "white_check_mark" "alive · up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3" "$HB_URL"
 
@@ -37,6 +54,19 @@ declare -A now
 [ "$disk" -ge 90 ] && now[disk]="disk at $disk%"
 [ "$claude" != ok ] && now[claude]="Claude: $claude"
 [ "$t3" != active ] && now[t3]="T3 Code is $t3"
+if [ $MACOS = 1 ]; then
+  pmset -g | grep -q 'SleepDisabled[[:space:]]*1' || now[sleep]="sleep is back on (pmset -a disablesleep 1)"
+  # This job runs under box-launch like T3, so it shares T3's ~/Documents privacy grant. A read that
+  # hangs means a privacy prompt is waiting on the screen and agents in ~/Documents are stuck too.
+  ( ls "$HOME/Documents" >/dev/null 2>&1 ) & probe=$!
+  for _ in 1 2 3 4 5; do kill -0 $probe 2>/dev/null || break; sleep 1; done
+  if kill -0 $probe 2>/dev/null; then
+    kill $probe 2>/dev/null
+    now[docs]="can't read ~/Documents: a privacy prompt is waiting (box desktop $ME, click Allow)"
+  elif ! wait $probe; then
+    now[docs]="~/Documents access denied for box-launch (System Settings > Privacy & Security > Files and Folders)"
+  fi
+fi
 seen=$(curl -s --max-time 15 "$HB_URL/json?poll=1&since=${STALE_MIN}m" | jq -r '.title // empty' | sort -u)
 while read -r peer; do
   [ -z "$peer" ] && continue

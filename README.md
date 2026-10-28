@@ -28,12 +28,12 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `docs/setup.md` | building a box from scratch, every trap included, plus a prompt to hand the job to an agent |
 | `docs/add-a-device.md` | adding a laptop, phone or another box to this setup (copy-paste prompt inside) |
 | `docs/machines.md` | the running record: what's on each machine, where credentials live, past incidents |
-| `reapers/` | systemd user timers for forgotten dev stacks, orphaned executors and stale /tmp trees |
+| `reapers/` | forgotten dev stacks, orphaned executors and stale /tmp trees: systemd user timers on Linux, launchd on a macOS box |
 | `bin/heavy-check`, `bin/install-heavy-checks` | `heavy-check run/submit/status/logs`; `cancel [JOB_ID / --id JOB_ID / --pid PID]` targets this cwd; [Linux/macOS install and usage](docs/heavy-checks.md) |
 | `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
 | `watch/` | babysits a few revnu creators every 3 hours and opens a T3 thread per problem (skynet) |
 | `skills/` | `sync-skills`: the global `bot-loop` skill on every machine, copied from revnu2 main hourly |
-| `mac/` | launchd jobs: `box sync-memory` every 6 hours (never starts Tailscale), `sync-skills` hourly |
+| `mac/` | launchd jobs: `box sync-memory` every 6 hours (never starts Tailscale), `sync-skills` hourly; `install-macbox` sets up a macOS agent box's heartbeat, reapers and `box-launch` (see docs/machines.md, "macOS box: air") |
 
 Paths only, never secret values. Machine-local state (FreeRDP logs, `.rdp` files) stays in
 `~/.config/agentbox/`.
@@ -60,7 +60,8 @@ alert: silence in the ntfy app is the signal then.
 
 Install on a box: copy `heartbeat/box-heartbeat` to `~/.local/bin/`, the unit and timer to
 `~/.config/systemd/user/`, write the topic and a `~/.config/box/peers` file (the other boxes'
-hostnames, one per line), then `systemctl --user enable --now box-heartbeat.timer`.
+hostnames, one per line), then `systemctl --user enable --now box-heartbeat.timer`. On a macOS box,
+`mac/install-macbox` installs it (and the reapers) as launchd agents; the topic and peers files are the same.
 
 ## Memory sync
 

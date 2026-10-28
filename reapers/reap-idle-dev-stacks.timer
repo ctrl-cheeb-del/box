@@ -2,7 +2,10 @@
 Description=Reap idle bun dev stacks every 30 min
 
 [Timer]
-OnBootSec=15min
+# Counted from when the user manager starts, not from boot: after a restart of the user manager
+# (jarvis, 2026-10-15) OnBootSec had long passed and OnUnitActiveSec had no run to count from,
+# so the timer sat "elapsed" for two weeks.
+OnStartupSec=15min
 OnUnitActiveSec=30min
 
 [Install]

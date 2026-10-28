@@ -12,21 +12,40 @@ cutoff=$((now - IDLE_HOURS * 3600))
 
 run() { if [ $DRY = 1 ]; then echo "  (dry-run) $*"; else "$@"; fi; }
 
+# Linux and macOS (bash 3.2 there): no /proc, GNU find/stat flags or `date -I` on macOS.
+if [ "$(uname)" = Darwin ]; then
+  mtime() { stat -f %m "$1"; }
+  proc_cwd() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; }
+else
+  mtime() { stat -c %Y "$1"; }
+  proc_cwd() { readlink "/proc/$1/cwd"; }
+fi
+is_dev_ts() { ps -o args= -p "$1" 2>/dev/null | grep -q 'scripts/dev.ts'; }
+# Seconds since a process started, from `ps -o etime` ([[dd-]hh:]mm:ss), which both have.
+proc_age() {
+  ps -o etime= -p "$1" 2>/dev/null | awk '{n = split($1, a, /[-:]/); s = a[n] + a[n-1] * 60
+    if (n > 2) s += a[n-2] * 3600; if (n > 3) s += a[n-3] * 86400; print s}'
+}
+# A file stamped at the cutoff, for `find -newer` (GNU touch takes "@epoch", BSD needs date -r).
+REF=$(mktemp); trap 'rm -f "$REF"' EXIT
+touch -d "@$cutoff" "$REF" 2>/dev/null || touch -t "$(date -r "$cutoff" +%Y%m%d%H%M.%S)" "$REF"
+
 # Newest sign that a person or agent worked in $1: edited files, git activity, or a Claude
 # transcript for that directory. The stack's own output (.dev, .next, .convex...) doesn't count.
 last_activity() {
-  local wt=$1 newest=0 t gitdir slug
-  t=$(find "$wt" \( -name node_modules -o -name .next -o -name .dev -o -name .convex -o -name .git \
+  local wt=$1 newest=0 t f gitdir slug
+  f=$(find "$wt" \( -name node_modules -o -name .next -o -name .dev -o -name .convex -o -name .git \
         -o -name .turbo -o -name .wrangler -o -name dist -o -name .cache \) -prune \
-        -o -type f -newermt "@$cutoff" -printf '%T@\n' -quit 2>/dev/null | cut -d. -f1)
-  [ -n "$t" ] && newest=$t
+        -o -type f -newer "$REF" -print -quit 2>/dev/null)
+  [ -n "$f" ] && t=$(mtime "$f") && newest=$t
   if [ -f "$wt/.git" ]; then gitdir=$(sed -n 's/^gitdir: //p' "$wt/.git"); else gitdir="$wt/.git"; fi
   for f in "$gitdir/index" "$gitdir/HEAD" "$gitdir/logs/HEAD"; do
-    [ -e "$f" ] && t=$(stat -c %Y "$f") && [ "$t" -gt "$newest" ] && newest=$t
+    [ -e "$f" ] && t=$(mtime "$f") && [ "$t" -gt "$newest" ] && newest=$t
   done
   slug=$(printf '%s' "$wt" | tr '/.' '--')
-  t=$(find "$HOME/.claude/projects/$slug" -maxdepth 1 -name '*.jsonl' -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
-  [ -n "$t" ] && [ "$t" -gt "$newest" ] && newest=$t
+  for f in "$HOME/.claude/projects/$slug"/*.jsonl; do
+    [ -e "$f" ] && t=$(mtime "$f") && [ "$t" -gt "$newest" ] && newest=$t
+  done
   echo "$newest"
 }
 
@@ -34,7 +53,7 @@ stop_group() { # $1 = orchestrator pid, $2 = process group
   run kill -TERM "$1" 2>/dev/null
   [ $DRY = 1 ] && return
   for _ in $(seq 30); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
-  pkill -TERM -g "$2" 2>/dev/null; sleep 3; pkill -KILL -g "$2" 2>/dev/null
+  kill -TERM -- "-$2" 2>/dev/null; sleep 3; kill -KILL -- "-$2" 2>/dev/null
 }
 
 # 1. Idle stacks: one dev.pid per `.dev/<profile>/` that points at a live scripts/dev.ts.
@@ -42,16 +61,17 @@ for pidfile in "$HOME"/.t3/worktrees/*/*/.dev/*/dev.pid "$HOME"/projects/*/.dev/
                "$HOME"/Documents/projects/*/.claude/worktrees/*/.dev/*/dev.pid; do
   [ -f "$pidfile" ] || continue
   pid=$(tr -dc 0-9 < "$pidfile"); [ -n "$pid" ] || continue
-  tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | grep -q 'scripts/dev.ts' || continue
+  is_dev_ts "$pid" || continue
   wt=${pidfile%/.dev/*}
-  started=$(stat -c %Y "/proc/$pid")
+  age=$(proc_age "$pid"); [ -n "$age" ] || continue
+  started=$((now - age))
   [ "$started" -gt "$cutoff" ] && continue
   last=$(last_activity "$wt")
   [ "$last" -gt "$cutoff" ] && continue
   idle_h=$(( (now - (last > started ? last : started)) / 3600 ))
   pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
   echo "stopping idle stack $wt (pid $pid, idle ${idle_h}h)"
-  [ $DRY = 0 ] && echo "[reaper] $(date -Is) stopped: no activity in this worktree for ${idle_h}h. Run \`bun dev --worktree\` to bring it back." >> "${pidfile%/dev.pid}/dev.log"
+  [ $DRY = 0 ] && echo "[reaper] $(date +%Y-%m-%dT%H:%M:%S%z) stopped: no activity in this worktree for ${idle_h}h. Run \`bun dev --worktree\` to bring it back." >> "${pidfile%/dev.pid}/dev.log"
   stop_group "$pid" "$pgid"
 done
 
@@ -59,19 +79,22 @@ done
 has_dev_ancestor() {
   local p=$1
   while [ "$p" -gt 1 ] 2>/dev/null; do
-    tr '\0' ' ' 2>/dev/null < "/proc/$p/cmdline" | grep -q 'scripts/dev.ts' && return 0
+    is_dev_ts "$p" && return 0
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$p" ] || return 1
   done
   return 1
 }
 for pid in $(pgrep -f 'next-server|convex-local-backend|workerd|node_modules/.bin/(next|convex) dev'); do
-  [ -d "/proc/$pid" ] || continue
+  kill -0 "$pid" 2>/dev/null || continue
   has_dev_ancestor "$pid" && continue
-  age=$(( now - $(stat -c %Y "/proc/$pid") )); [ "$age" -lt "$ORPHAN_MIN_AGE" ] && continue
+  age=$(proc_age "$pid"); [ "${age:-0}" -lt "$ORPHAN_MIN_AGE" ] && continue
   # Only directories that ran a `bun dev` stack; a plain `next dev` in another repo is not ours.
-  d=$(readlink "/proc/$pid/cwd")
+  # A process that exits after pgrep has no cwd; "" then made `dirname` loop on "." forever and
+  # the run never finished, so the timer never fired again (skynet and jarvis, October 2026).
+  d=$(proc_cwd "$pid"); cwd=$d
+  case $d in /*) ;; *) continue ;; esac
   while [ "$d" != / ] && ! compgen -G "$d/.dev/*/dev.pid" >/dev/null; do d=$(dirname "$d"); done
   [ "$d" = / ] && continue
-  echo "killing orphan $pid ($(ps -o comm= -p "$pid")) in $(readlink "/proc/$pid/cwd")"
+  echo "killing orphan $pid ($(ps -o comm= -p "$pid")) in $cwd"
   run kill -TERM "$pid"
 done

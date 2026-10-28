@@ -19,7 +19,12 @@ reaper = importlib.util.module_from_spec(spec)
 loader.exec_module(reaper)
 
 
-@unittest.skipUnless(sys.platform.startswith("linux") and os.getuid() != 0, "Linux user reaper")
+def passwordless_sudo():
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+
+
+@unittest.skipUnless((sys.platform.startswith("linux") or sys.platform == "darwin") and os.getuid() != 0,
+                     "Linux/macOS user reaper")
 class ReaperTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="box-reaper-test-")
@@ -107,7 +112,7 @@ class ReaperTest(unittest.TestCase):
         link = self.root / "link"
         link.symlink_to(path, target_is_directory=True)
         self.assertIsNone(self.scan(link))
-        for name in ("tmux-1000", "ssh-xyz", "systemd-private-xyz", ".X11-unix", ".ICE-unix"):
+        for name in ("tmux-1000", "ssh-xyz", "systemd-private-xyz", ".X11-unix", ".ICE-unix", "com.apple.launchd.x"):
             self.tree(name)
         output = self.run_reaper()
         self.assertIn("0 entries", output)
@@ -136,6 +141,7 @@ class ReaperTest(unittest.TestCase):
             self.assertIn("0 entries", self.run_reaper())
         self.assertTrue(path.exists())
 
+    @unittest.skipIf(sys.platform == "darwin" and not passwordless_sudo(), "macOS scan needs passwordless sudo for lsof")
     def test_live_cwd_and_open_file_are_protected_by_inode(self):
         path = self.tree()
         process = subprocess.Popen([sys.executable, "-c",
