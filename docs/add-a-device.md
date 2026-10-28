@@ -55,6 +55,12 @@ Things that will need you:
 - The OAuth MCPs (revnu, Linear, Slack, Vercel, Cloudflare, Replicate): `box desktop <name>`, run
   `claude` in `~/Documents/projects/revnu2`, `/mcp`, sign in to each.
 
+## A Mac as a box
+
+An old Mac works as a box too: see `docs/machines.md`, "macOS box: air", for the recipe that differs from
+Ubuntu (pmset `disablesleep`, FileVault off + auto-login, `t3 service install` under launchd, the Keychain-over-SSH
+trap). Register it with the `macbox` role so `box status/logs/update/reboot/desktop` use the macOS paths.
+
 ## Handing a box to a coworker
 
 Point them at `docs/setup.md`. They use their own accounts for everything except the

@@ -362,3 +362,44 @@ no Claude, no heartbeat, and `all`, `update`, `sync-memory`, `sync-skills` and `
 - Remote Desktop is on (Windows 11 Pro), with Network Level Authentication and the "Remote Desktop"
   firewall group on every profile. `box desktop pc` opens it with FreeRDP; the password is Art's Windows
   password, in the Mac Keychain item `box-rdp-pc` (account `art`).
+
+## macOS box: air (2026-10-28)
+
+Art's old MacBook Air (13-inch, M4, 2025; 16 GB, 460 GB), macOS 26, user `art`. Role `macbox` in `machines`: an
+agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sharing instead of RDP.
+`ssh air` / `box air`: home network `air.local` first, then Tailscale `100.106.79.13`. T3 Connect environment "air".
+
+- **Name**: ComputerName, LocalHostName and HostName are all `air` (`scutil --set`), and so is the Tailscale machine
+  name (`tailscale set --hostname=air`). T3 labels an environment with the ComputerName.
+- **Always-on**: `pmset -a disablesleep 1` (`SleepDisabled 1`: no sleep even with the lid shut), `sleep 0`,
+  `disksleep 0`, `standby 0`, `powernap 0`, `womp 1`; the display still turns off (10 min on AC). **FileVault is off and
+  auto-login as art is on**, so after a reboot or power cut it comes back to the desktop with nobody there (tested
+  2026-10-28: back on Tailscale about 40 s after `shutdown -r`). Tailscale is the GUI app; it starts at login via
+  `TailscaleStartOnLogin` plus `~/Library/LaunchAgents/com.art.tailscale-open.plist`.
+- **sudo**: passwordless (`/etc/sudoers.d/art-nopasswd`), like the Linux boxes.
+- **T3**: standalone nightly (`~/.local/bin/t3` -> `~/.t3/runtime/versions/...`), installed as a service with
+  `t3 service install`: `~/Library/LaunchAgents/com.t3tools.t3code.service.plist`, log
+  `~/.t3/userdata/logs/boot-service.log` (`box logs air`). It listens on `0.0.0.0:3773`. The old hand-made agent
+  (`com.t3tools.t3serve`, an npm-installed t3 0.0.32) is parked in `~/Library/LaunchAgents.disabled/`.
+- **PATH**: `~/.zshenv` puts node v24.19 (nvm), `~/.local/bin`, `~/.bun/bin` and Homebrew first, matching the T3
+  service's PATH, so non-interactive SSH commands find the same CLIs. Codex is an npm global under v24.19
+  (`npm i -g @openai/codex@latest` updates it); an older one remains under v24.3 for interactive shells.
+- **Claude**: no Claude login. `~/.claude/settings.json` is the Mac's with `ANTHROPIC_BASE_URL=http://100.85.99.101:24873`
+  (skynet's proxy over Tailscale); `apiKeyHelper` reads `~/.cli-proxy-api/proxy-key` (same key as jarvis). Skills,
+  plugins and the MCP servers were copied from the Mac (same `/Users/art` paths), minus Paper; GSC client secrets at
+  `~/Documents/gsc_client_secrets.json`. OAuth MCPs still need `/mcp` at the Air's screen. Backups of the previous
+  config: `~/.claude/settings.json.bak-pre-air-setup`, `~/.claude.json.bak-pre-air-setup`.
+- **Codex**: ChatGPT login art@freebrey.com (Pro), the same account as the other machines (it was art@revnu.app before).
+- **Keychain trap**: SSH sessions on macOS can't read the login Keychain ("User interaction is not allowed"), even
+  though auto-login unlocks it for the GUI session where T3 and its agents run. So `gh` uses file storage
+  (`--insecure-storage`, `~/.config/gh/hosts.yml`) and works over SSH too, while Doppler's login stays in the Keychain:
+  it works for agents but not in a plain SSH shell. To run something in the GUI session from SSH:
+  `~/.local/state/air-setup/gui-run "<command>"` (a one-shot launch agent).
+- **revnu2**: the existing full clone at `~/Documents/projects/revnu2`, switched to `main` (the old
+  `revnu2-workflows-public` worktree, which held `main`, is now detached at the same commit). Doppler `revnu2/dev`,
+  `bun setup`.
+- **Screen Sharing** is on (`com.apple.screensharing`); `box desktop air` opens `vnc://art@<host>` in Screen Sharing.
+- **Fleet**: its existing key (`~/.ssh/id_ed25519`, listed as `art@air fleet`) is on skynet, jarvis and the Mac;
+  theirs are on it; all have `air` / `skynet` / `jarvis` / `mac` SSH aliases.
+- **Not on air (Linux-only for now)**: the heartbeat (uses `/proc`, `free`, systemd and bash 4), the reaper timers
+  (`/proc`), zram. macOS compresses memory itself.

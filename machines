@@ -3,8 +3,10 @@
 #                                                  proxy = runs CLIProxyAPI (Claude accounts live there)
 #                                                  mac = Art's MacBook (no Ubuntu services; reachable once Remote Login is on)
 #                                                  windows = a Windows PC: SSH only, never an agent box, skipped by "all" and every sync
+#                                                  macbox = an agent box running macOS (launchd, Screen Sharing); Claude via the proxy
 # An optional 5th column is the login user when it isn't art.
 skynet    skynet.local    100.85.99.101     default,proxy
 jarvis    jarvis.local    100.123.203.103   -
+air       air.local       100.106.79.13     macbox
 mac       arts-MacBook-Pro.local 100.76.37.10 mac
 pc        DESKTOP-79OMK99.local  100.105.56.69  windows   art
