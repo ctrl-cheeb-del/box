@@ -53,7 +53,9 @@ Each box runs `box-heartbeat` every 30 minutes (`heartbeat/`). It posts an "aliv
 memory, disk, load, Claude/T3 status) to `<topic>-hb`, which only the boxes read, so the phone stays
 quiet. The phone subscribes to `<topic>` and gets an urgent push when a peer box has sent nothing for 75
 minutes, memory or disk passes 90%, Claude can't reach the proxy, or T3 is down, and another when it
-clears. Messages go to an ntfy.sh topic; the topic name is the only secret, so it lives in
+clears. Each alert is titled with the box it's about ("skynet: no heartbeat", "skynet: fine again"),
+and only one box reports it. A box that comes back says why it was gone: offline, restarted cleanly,
+lost power or crashed, or asleep. A box that can't reach ntfy judges no one. Messages go to an ntfy.sh topic; the topic name is the only secret, so it lives in
 `~/.config/box/ntfy-topic` on each box (and `~/.config/agentbox/ntfy-topic` on the Mac), never here.
 Subscribe to it in the ntfy phone app. A power cut takes both boxes down at once, so nobody is left to
 alert: silence in the ntfy app is the signal then.
