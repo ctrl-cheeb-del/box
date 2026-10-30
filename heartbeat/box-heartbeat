@@ -2,20 +2,31 @@
 # Every 30 min (box-heartbeat.timer; launchd com.box.heartbeat on a macOS box): post an "alive"
 # message to <topic>-hb (which no phone subscribes to), then check the other boxes' heartbeats
 # there and this box's own health. Problems go to <topic> itself, once when they start and once
-# when they clear.
+# when they clear, titled with the box they're about ("skynet: no heartbeat", "skynet: fine again"),
+# never the box that noticed, and only once however many boxes notice.
+# A box that comes back after being gone says why in "<box>: fine again": restarted (cleanly or not),
+# asleep, or up but offline. A box that can't reach ntfy judges nothing, since from there every
+# peer looks silent.
 # Config, never committed: ~/.config/box/ntfy-topic (the topic name is the only secret)
 # and ~/.config/box/peers (one box hostname per line).
 # Needs bash 4 (associative arrays): on macOS that's Homebrew's bash, first on the job's PATH.
 set -u
-CONF=~/.config/box
+CONF=${BOX_CONF:-$HOME/.config/box}
 TOPIC=$(cat "$CONF/ntfy-topic") || exit 1
 URL="https://ntfy.sh/$TOPIC"
 HB_URL="$URL-hb"
 ME=$(hostname)
 STALE_MIN=${STALE_MIN:-75}
 STATE="$CONF/alerts"; touch "$STATE"
+LAST_OK="$CONF/last-ok"          # when this box last got a heartbeat out
+OFFLINE="$CONF/offline-since"    # first run that couldn't, until one can again
+NOW=$(date +%s)
 
-push() { curl -s -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "${5:-$URL}"; }
+push() { curl -sf -o /dev/null --max-time 15 -H "Title: $1" -H "Priority: $2" -H "Tags: $3" -d "$4" "${5:-$URL}"; }
+ago() {
+  local m=$(( $1 / 60 ))
+  if [ $m -lt 90 ]; then echo "$m min"; elif [ $m -lt 2880 ]; then echo "$((m / 60))h $((m % 60))m"; else echo "$((m / 1440)) days"; fi
+}
 
 MACOS=0; [ "$(uname)" = Darwin ] && MACOS=1
 if [ $MACOS = 1 ]; then
@@ -25,11 +36,13 @@ if [ $MACOS = 1 ]; then
   disk=$(df /System/Volumes/Data | awk 'NR==2{print $5+0}')
   load=$(sysctl -n vm.loadavg | awk '{print $2}')
   up=$(uptime | sed 's/.*up \([^,]*\),.*/\1/')
+  boot=$(sysctl -n kern.boottime | awk -F'[ ,]+' '{print $4}')
 else
   mem=$(free | awk '/Mem/{printf "%d", $3*100/$2}')
   disk=$(df / | awk 'NR==2{print $5+0}')
   load=$(cut -d" " -f1 /proc/loadavg)
   up=$(uptime -p | sed 's/^up //')
+  boot=$(date -d "$(uptime -s)" +%s)
 fi
 claude=ok
 if [ -f ~/.cli-proxy-api/management-key ]; then
@@ -45,11 +58,54 @@ if [ $MACOS = 1 ]; then
 else
   t3=$(systemctl --user is-active t3code)
 fi
+stats="up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3"
 
-push "$ME" min "white_check_mark" "alive · up $up · mem $mem% · disk $disk% · load $load · claude $claude · t3 $t3" "$HB_URL"
+if ! push "$ME" min "white_check_mark" "alive · $stats" "$HB_URL"; then
+  # No internet (or no ntfy). Note when it started so the run that gets through can say so.
+  [ -s "$OFFLINE" ] || echo "$NOW" > "$OFFLINE"
+  exit 0
+fi
+last_ok=$(cat "$LAST_OK" 2>/dev/null); offline_since=$(cat "$OFFLINE" 2>/dev/null)
+echo "$NOW" > "$LAST_OK"; rm -f "$OFFLINE"
 
-# Problems: key=description. Each fires once, and "cleared" once it's gone.
+# What's already on the alert topic, as "<time> <title>" lines, so boxes don't repeat each other.
+alerts=$(curl -sf --max-time 15 "$URL/json?poll=1&since=12h" | jq -r 'select(.event=="message") | "\(.time) \(.title)"')
+posted() { awk -v t="$1" -v s="$2" '$1 >= s && substr($0, index($0, " ") + 1) == t {f = 1} END {exit !f}' <<<"$alerts"; }
+
+# Back after a gap (a run is every 30 min): work out why and tell the phone if anyone said we were
+# down, or if we died without shutting down.
+if [ -n "$last_ok" ] && [ $((NOW - last_ok)) -gt 2700 ]; then
+  abrupt=0
+  if [ "$boot" -gt "$last_ok" ]; then
+    if [ $MACOS = 1 ]; then
+      # `last reboot` lists "shutdown time Wed Oct 28 19:53" lines too: a clean one comes just before the boot.
+      sd=$(last reboot | awk '/^shutdown/{print $3, $4, $5, $6; exit}')
+      sd=$(date -j -f "%a %b %d %H:%M %Y" "$sd $(date +%Y)" +%s 2>/dev/null || echo 0)
+      [ "$sd" -ge "$last_ok" ] && [ "$sd" -le "$boot" ] || abrupt=1
+    else
+      journalctl -b -1 _PID=1 -q --no-pager -g 'Reached target (shutdown\.target|Shutdown)' 2>/dev/null | grep -q . || abrupt=1
+    fi
+    if [ $abrupt = 1 ]; then
+      why="Restarted without shutting down: lost power or crashed"
+    else
+      why="Was shut down or restarted"
+    fi
+  elif [ $MACOS = 1 ] && st=$(sysctl -n kern.waketime | awk -F'[ ,]+' '{print $4}') && [ "$st" -gt "$last_ok" ]; then
+    why="Was asleep for $(ago $((NOW - last_ok)))"
+  elif [ -n "$offline_since" ]; then
+    why="Was offline (no internet) for about $(ago $((NOW - last_ok)))"
+  else
+    why="Was on and online, but its heartbeat stopped for $(ago $((NOW - last_ok))) (stuck timer or frozen)"
+  fi
+  if [ $abrupt = 1 ] || posted "$ME: no heartbeat" "$last_ok"; then
+    push "$ME: fine again" default "white_check_mark" "$why."
+  fi
+fi
+
+# Problems: key=description. Each fires once, and "fixed" once it's gone.
 declare -A now
+declare -A label=([mem]="memory high" [disk]="disk nearly full" [claude]="Claude unreachable" [t3]="T3 Code down"
+                  [sleep]="sleep back on" [docs]="~/Documents blocked")
 [ "$mem" -ge 90 ] && now[mem]="memory at $mem%"
 [ "$disk" -ge 90 ] && now[disk]="disk at $disk%"
 [ "$claude" != ok ] && now[claude]="Claude: $claude"
@@ -67,17 +123,47 @@ if [ $MACOS = 1 ]; then
     now[docs]="~/Documents access denied for box-launch (System Settings > Privacy & Security > Files and Folders)"
   fi
 fi
-seen=$(curl -s --max-time 15 "$HB_URL/json?poll=1&since=${STALE_MIN}m" | jq -r '.title // empty' | sort -u)
-while read -r peer; do
-  [ -z "$peer" ] && continue
-  grep -qx "$peer" <<<"$seen" || now["peer-$peer"]="$peer: no heartbeat for ${STALE_MIN}+ min (off, offline or crashed?)"
-done < "$CONF/peers"
+
+# Peers: when each one last posted a heartbeat ("<time> <message>").
+declare -A last=() quiet=()
+if hb=$(curl -sf --max-time 15 "$HB_URL/json?poll=1&since=12h"); then
+  while read -r peer; do
+    [ -z "$peer" ] && continue
+    last[$peer]=$(jq -rs --arg p "$peer" '[.[] | select(.event=="message" and .title==$p)] | last | select(.) | "\(.time) \(.message)"' <<<"$hb")
+    [ "${last[$peer]%% *}" -ge $((NOW - STALE_MIN * 60)) ] 2>/dev/null || quiet[$peer]=1
+  done < "$CONF/peers"
+  for peer in "${!quiet[@]}"; do
+    seen=${last[$peer]%% *}
+    if [ -n "$seen" ]; then
+      now["peer-$peer"]="No heartbeat for $(ago $((NOW - seen))) (off, offline or crashed?)"
+    else
+      now["peer-$peer"]="No heartbeat for 12h+ (off, offline or crashed?)"; seen=$((NOW - 43200))
+    fi
+    # Another box may have said so already: count it as reported.
+    if ! grep -qx "peer-$peer" "$STATE" && posted "$peer: no heartbeat" "$seen"; then echo "peer-$peer" >> "$STATE"; fi
+  done
+else
+  # Can't read the heartbeats: keep the peers' state as it is rather than judge them on nothing.
+  for k in $(grep '^peer-' "$STATE"); do now[$k]=kept; done
+fi
 
 for k in "${!now[@]}"; do
-  grep -qx "$k" "$STATE" || push "$ME: problem" urgent "rotating_light" "${now[$k]}"
+  grep -qx "$k" "$STATE" && continue
+  case $k in
+    peer-*) push "${k#peer-}: no heartbeat" urgent "rotating_light" "${now[$k]}" ;;
+    *) push "$ME: ${label[$k]:-$k}" urgent "rotating_light" "${now[$k]}. Now $stats" ;;
+  esac
 done
 while read -r k; do
   [ -z "$k" ] && continue
-  [ -n "${now[$k]+x}" ] || push "$ME: cleared" default "white_check_mark" "${k#peer-} is fine again"
+  [ -n "${now[$k]+x}" ] && continue
+  case $k in
+    peer-*)
+      p=${k#peer-}
+      # The box itself says why it was gone when it gets back; only fill in if it didn't.
+      posted "$p: fine again" $((NOW - 3600)) ||
+        push "$p: fine again" default "white_check_mark" "Heartbeat is back." ;;
+    *) push "$ME: fine again" default "white_check_mark" "No longer: ${label[$k]:-$k}." ;;
+  esac
 done < "$STATE"
 printf '%s\n' "${!now[@]}" | grep -v '^$' > "$STATE" || true
