@@ -17,27 +17,57 @@ import shlex
 
 ROOT = Path(os.environ.get("HEAVY_CHECK_STATE", Path.home() / ".local/state/box/heavy-check")).absolute()
 CONFIG = Path(os.environ.get("HEAVY_CHECK_CONFIG", Path.home() / ".config/box/heavy-check.json")).absolute()
-DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4}
+DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 6}
 STOP = None
 SIGNALS = {signal.SIGINT, signal.SIGTERM}
 HEARTBEAT = 30
+DEFAULT_MAX_WAIT = 900
+# A worker's own timeout writes the useful message; reap is only the backstop for
+# workers that can't (older installs, wedged processes).
+REAP_GRACE = 60
 BOOT = None
+MEMORY_NOTE = ""
 
 
 def settings():
     config = DEFAULTS | (json.loads(CONFIG.read_text()) if CONFIG.exists() else {})
     if not isinstance(config["slots"], int) or not 1 <= config["slots"] <= 32:
         raise ValueError("slots must be an integer from 1 to 32")
-    for key in ("reserve_gib", "headroom_gib"):
+    for key in ("reserve_gib", "headroom_gib", "idle_gib"):
         if not isinstance(config[key], (int, float)) or config[key] < 0:
             raise ValueError(f"{key} must be a nonnegative number")
     return config
 
 
+def max_wait(env):
+    """Seconds a job may wait for admission, or None for no limit."""
+    raw = env.get("HEAVY_CHECK_MAX_WAIT", "").strip().lower()
+    if not raw:
+        return DEFAULT_MAX_WAIT
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", raw)
+    if not match:
+        raise ValueError(f"HEAVY_CHECK_MAX_WAIT={raw!r}: use seconds, or a number ending in s, m or h (0 = no limit)")
+    seconds = float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
+    return seconds or None
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
 def available_gib():
+    global MEMORY_NOTE
     if sys.platform == "darwin":
+        # 1 normal, 2 warn, 4 critical. A busy Mac sits at warn for hours, and the page
+        # count below already shrinks then, so only critical pauses admission.
         pressure = subprocess.check_output(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"], text=True).strip()
-        if pressure != "1":
+        MEMORY_NOTE = {"1": "", "2": "macOS memory pressure: warn"}.get(pressure, "macOS memory pressure: critical")
+        if pressure not in ("1", "2"):
             return 0
         stats = subprocess.check_output(["vm_stat"], text=True)
         page_size = int(re.search(r"page size of (\d+) bytes", stats).group(1))
@@ -73,6 +103,25 @@ def identity(pid):
         return None
 
 
+def identities(pids):
+    """identity() for many PIDs: one ps call on macOS rather than one per PID per poll."""
+    pids = sorted({pid for pid in pids if pid})
+    if sys.platform != "darwin" or not pids:
+        return {pid: identity(pid) for pid in pids}
+    global BOOT
+    if BOOT is None:
+        BOOT = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True).strip()
+    # All processes, not -p: one out-of-range PID makes macOS ps print nothing at all.
+    result = subprocess.run(["ps", "-ax", "-o", "pid=", "-o", "stat=", "-o", "lstart="],
+                            text=True, capture_output=True, timeout=5)
+    found = {pid: None for pid in pids}
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and not fields[1].startswith("Z"):
+            found[int(fields[0])] = BOOT + ":" + fields[2].rstrip()
+    return found
+
+
 @contextlib.contextmanager
 def database():
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -90,7 +139,7 @@ def database():
         columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
         for name, kind in {"uid": "INTEGER", "submitter": "INTEGER", "environment": "TEXT", "cancel_reason": "TEXT",
                            "cancel_pid": "INTEGER", "cancel_signal": "INTEGER",
-                           "cancel_at": "REAL", "recovery_reason": "TEXT"}.items():
+                           "cancel_at": "REAL", "recovery_reason": "TEXT", "caller_identity": "TEXT"}.items():
             if name not in columns:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
         yield db
@@ -103,9 +152,31 @@ def database():
 
 
 def reap(db):
-    for job in db.execute("SELECT * FROM jobs WHERE state IN ('queued','running')").fetchall():
-        current = identity(job["owner"])
+    jobs = db.execute("SELECT * FROM jobs WHERE state IN ('queued','running')").fetchall()
+    alive = identities([pid for job in jobs for pid in (job["owner"], job["submitter"], job["pgid"])])
+    now = time.time()
+    for job in jobs:
+        # Only foreground `run` records its caller; nobody reads a job whose caller
+        # is gone, so it must not keep its place in line or its slot.
+        if (job["caller_identity"] and not job["cancel"]
+                and alive.get(job["submitter"]) != job["caller_identity"]):
+            request_cancel(db, job["id"], f"caller pid={job['submitter']} exited while the job was {job['state']}; "
+                           "nobody is waiting for it, so it was cancelled to free the line")
+            job = db.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        if job["state"] == "queued" and not job["cancel"]:
+            try:
+                limit = max_wait(json.loads(job["environment"]) if job["environment"] else {})
+            except ValueError:
+                limit = DEFAULT_MAX_WAIT
+            if limit and job["created"] and now - job["created"] > limit + REAP_GRACE:
+                request_cancel(db, job["id"], f"waited {duration(now - job['created'])} in the queue, past its "
+                               f"max wait of {duration(limit)} (HEAVY_CHECK_MAX_WAIT)")
+                job = db.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        current = alive.get(job["owner"])
         if current is not None and current == job["identity"]:
+            continue
+        if job["state"] == "queued" and job["cancel"]:
+            db.execute("UPDATE jobs SET state='cancelled',code=130,finished=? WHERE id=?", (now, job["id"]))
             continue
         if job["state"] == "queued":
             reason = f"queued worker pid={job['owner']} disappeared (signal/sender unknown); restarted"
@@ -114,7 +185,7 @@ def reap(db):
             continue
         # If the supervisor was SIGKILLed, kill its still-identifiable child group.
         # The child inherits the slot lock, so a surviving command never frees capacity.
-        if job["pgid"] and identity(job["pgid"]) == job["child_identity"]:
+        if job["pgid"] and alive.get(job["pgid"]) == job["child_identity"]:
             signal_group(job["pgid"], signal.SIGKILL)
         reason = f"running worker pid={job['owner']} disappeared (signal/sender unknown)"
         db.execute("""UPDATE jobs SET state='lost',finished=?,code=125,
@@ -246,7 +317,24 @@ def launch(db, job_id, foreground=False):
     return child
 
 
-def queue_notice(db, job, config, available, required, now):
+def describe(job, now):
+    """One holder or waiter, short enough to read in a progress line."""
+    command = json.loads(job["command"])
+    words = [Path(command[0]).name.removesuffix(".heavy-check-original")]
+    for word in command[1:]:
+        if word == "--no-env-file":
+            continue
+        words.append(os.path.relpath(word, job["cwd"]) if word.startswith(job["cwd"] + "/") else word)
+    text = shlex.join(words)
+    text = text if len(text) <= 60 else text[:57] + "..."
+    if job["state"] == "running":
+        age = f"running {duration(now - job['started'])}"
+    else:
+        age = f"queued {duration(now - job['created'])}"
+    return f"{job['id']} {age} in {Path(job['cwd']).name} ({text})"
+
+
+def queue_notice(db, job, config, available, required, now, limit):
     queued = db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created,id").fetchall()
     running = db.execute("SELECT * FROM jobs WHERE state='running' ORDER BY started,id").fetchall()
     eligible = [q for q in queued if not any(r["cwd"] == q["cwd"] for r in running)]
@@ -257,32 +345,39 @@ def queue_notice(db, job, config, available, required, now):
     if any(q["id"] == job["id"] for q in eligible) and eligible[0]["id"] != job["id"]:
         gates.append("eligible jobs ahead")
     if len(running) >= config["slots"]:
-        gates.append("slots full")
+        gates.append(f"slots full ({len(running)}/{config['slots']})")
     if available < required:
         gates.append("memory")
-    # Quantize memory to GiB: small fluctuations must not spam every poll.
-    snapshot = (position, len(queued), tuple((r["id"], r["pgid"]) for r in running),
-                tuple(gates), int(available), required, config["slots"],
-                config["headroom_gib"], config["reserve_gib"])
-    lines = [f"queued position={position}/{len(queued)}; waiting for {', '.join(gates) or 'slot lock'}; "
-             f"memory available={available:.1f} GiB required={required:.1f} GiB "
-             f"(headroom={config['headroom_gib']:g}, reserve={config['reserve_gib']:g}); ETA unknown"]
-    for other in running:
-        lines.append(f"slot: id={other['id']} pid={other['pgid']} worker={other['owner']} "
-                     f"running={int(now - other['started'])}s cwd={other['cwd']} "
-                     f"command={shlex.join(json.loads(other['command']))}")
-    if not running:
-        lines.append("slots: no running jobs")
-    return snapshot, "\n".join(lines)
+    ahead = [*running, *queued[:position - 1]]
+    snapshot = (position, tuple(other["id"] for other in ahead), tuple(gates))
+    memory = f"memory {available:.1f} GiB free, {required:.1f} GiB needed" + (f" ({MEMORY_NOTE})" if MEMORY_NOTE else "")
+    waited = now - job["created"]
+    deadline = (f"gives up in {duration(max(0, limit - waited))} (HEAVY_CHECK_MAX_WAIT={limit:g}s)" if limit
+                else "no max wait (HEAVY_CHECK_MAX_WAIT=0)")
+    line = (f"waiting {duration(waited)}; place {position} of {len(queued)} queued; "
+            f"ahead: {'; '.join(describe(other, now) for other in ahead) or 'nobody'}; "
+            f"{memory}; blocked by: {', '.join(gates) or 'nothing, starting'}; {deadline}")
+    return snapshot, line, ahead
+
+
+def timeout_message(ahead, line, limit, now):
+    holders = "\n".join(f"  {describe(other, now)}" for other in ahead) or "  nobody (memory alone kept it out)"
+    return (f"gave up after waiting {duration(limit)} in the heavy-check queue; the command never started.\n"
+            f"Last state: {line}\nAhead of it:\n{holders}\n"
+            "To wait longer: HEAVY_CHECK_MAX_WAIT=30m (or 0 for no limit) before the command. "
+            "To see the queue: heavy-check status.")
 
 
 def wait_for_job(job_id, child):
     watch_signals()
     # Separate files preserve stdout/stderr and allow a recovered worker to append.
     with open(ROOT / f"{job_id}.stdout", "rb") as output, open(ROOT / f"{job_id}.log", "rb") as log:
+        last_reap = 0
         while True:
             with database() as db:
-                reap(db)
+                if time.monotonic() - last_reap >= 1:
+                    reap(db)
+                    last_reap = time.monotonic()
                 event = pending_signal()
                 if event:
                     request_cancel(db, job_id, signal_reason(event, f"caller pid={os.getpid()}"),
@@ -348,7 +443,8 @@ def work(job_id):
     state, code = "failed", 125
     failure_reason = ""
     try:
-        last_notice, last_snapshot = 0, None
+        limit = max_wait(os.environ)
+        last_notice, last_snapshot = None, None
         while child is None:
             config = settings()
             with database() as db:
@@ -366,13 +462,20 @@ def work(job_id):
                 first = db.execute("""SELECT q.id FROM jobs q WHERE q.state='queued'
                     AND NOT EXISTS (SELECT 1 FROM jobs r WHERE r.state='running' AND r.cwd=q.cwd)
                     ORDER BY q.created,q.id LIMIT 1""").fetchone()
+                running = db.execute("SELECT COUNT(*) FROM jobs WHERE state='running'").fetchone()[0]
                 # Account for a newly admitted job before its RSS has grown.
                 young = db.execute("SELECT COUNT(*) FROM jobs WHERE state='running' AND started>?", (time.time() - 10,)).fetchone()[0]
                 available = available_gib()
-                required = config["headroom_gib"] + config["reserve_gib"] * (1 + young)
+                # With no queued job running, nothing else of ours can grow into the headroom,
+                # so the lone job only needs its own working memory.
+                required = (config["headroom_gib"] + config["reserve_gib"] * (1 + young) if running
+                            else config["idle_gib"])
                 enough = available >= required
                 same_checkout = db.execute("SELECT 1 FROM jobs WHERE state='running' AND cwd=?", (job["cwd"],)).fetchone()
-                if first and first["id"] == job_id and enough and not same_checkout:
+                if first and first["id"] == job_id and enough and not same_checkout and running < config["slots"]:
+                    # The count above is the real limit. The lock files only keep workers from
+                    # older installs, which count by lock, from over-admitting beside us; a lock
+                    # held by a stray process must not stop the line.
                     for number in range(config["slots"]):
                         candidate = open(ROOT / f"slot-{number}.lock", "a+")
                         try:
@@ -381,20 +484,29 @@ def work(job_id):
                             break
                         except BlockingIOError:
                             candidate.close()
-                    if slot is not None:
-                        env = os.environ | {"HEAVY_CHECK_JOB": job_id, "HEAVY_CHECK_STATE": str(ROOT)}
-                        child = subprocess.Popen(json.loads(job["command"]), cwd=job["cwd"], env=env,
-                                                 start_new_session=True, pass_fds=(slot.fileno(),),
-                                                 preexec_fn=unblock_signals)
-                        db.execute("UPDATE jobs SET state='running',pgid=?,child_identity=?,started=? WHERE id=?",
-                                   (child.pid, identity(child.pid), time.time(), job_id))
+                    if slot is None:
+                        print(f"[heavy-check {job_id}] every slot lock is held but only {running} of "
+                              f"{config['slots']} jobs run; ignoring stray lock holders", file=sys.stderr, flush=True)
+                    env = os.environ | {"HEAVY_CHECK_JOB": job_id, "HEAVY_CHECK_STATE": str(ROOT)}
+                    # The lock stays with this worker: a daemon the command leaves behind
+                    # must not inherit it and hold the slot after the job ends.
+                    child = subprocess.Popen(json.loads(job["command"]), cwd=job["cwd"], env=env,
+                                             start_new_session=True, preexec_fn=unblock_signals)
+                    db.execute("UPDATE jobs SET state='running',pgid=?,child_identity=?,started=? WHERE id=?",
+                               (child.pid, identity(child.pid), time.time(), job_id))
                 if child is None:
-                    snapshot, notice = queue_notice(db, job, config, available, required, time.time())
-                    if snapshot != last_snapshot or time.monotonic() - last_notice >= HEARTBEAT:
-                        print(f"[heavy-check {job_id}] {notice}", file=sys.stderr, flush=True)
+                    now = time.time()
+                    snapshot, line, ahead = queue_notice(db, job, config, available, required, now, limit)
+                    if limit and now - job["created"] >= limit:
+                        state, code = "timeout", 124
+                        failure_reason = timeout_message(ahead, line, limit, now)
+                        break
+                    if (last_notice is None or snapshot != last_snapshot
+                            or time.monotonic() - last_notice >= HEARTBEAT):
+                        print(f"[heavy-check {job_id}] {line}", file=sys.stderr, flush=True)
                         last_notice, last_snapshot = time.monotonic(), snapshot
             if child is None:
-                time.sleep(0.25)
+                time.sleep(1)
         if child is not None:
             print(f"[heavy-check {job_id}] running", file=sys.stderr, flush=True)
             while True:
@@ -458,14 +570,17 @@ def main():
             parser.error("supply a command after --")
         if args.action == "run" and nested():
             os.execvpe(command[0], command, os.environ)
+        max_wait(os.environ)  # A bad value fails here, not after queueing.
         watch_signals()
         job_id = uuid.uuid4().hex[:12]
+        caller = identity(os.getpid())
         with database() as db:
             reap(db)
-            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,uid,submitter,environment)
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,uid,submitter,environment,
+                caller_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                        (job_id, time.time(), os.getcwd(), json.dumps(command), "queued", os.getpid(),
-                        identity(os.getpid()), os.getuid(), os.getpid(), json.dumps(dict(os.environ))))
+                        caller, os.getuid(), os.getpid(), json.dumps(dict(os.environ)),
+                        caller if args.action == "run" else None))
             child = launch(db, job_id, foreground=args.action == "run")
         print(f"[heavy-check {job_id}] queued id={job_id} pid={child.pid} caller={os.getpid()} cwd={os.getcwd()}",
               file=sys.stderr, flush=True)

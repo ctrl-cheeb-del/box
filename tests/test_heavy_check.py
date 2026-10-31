@@ -14,9 +14,21 @@ import time
 import unittest
 import shutil
 import sqlite3
+import fcntl
 from unittest import mock
 
 QUEUE = Path(__file__).resolve().parents[1] / "bin/heavy-check"
+
+
+@contextlib.contextmanager
+def chdir(path):
+    # contextlib.chdir is 3.11+; macOS boxes ship 3.9.
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 @unittest.skipUnless(sys.platform in ("linux", "darwin"), "queue supports Linux and macOS")
@@ -30,7 +42,7 @@ class QueueTests(unittest.TestCase):
         self.ids = []
 
     def configure(self, slots=2, reserve=0):
-        self.config.write_text(json.dumps({"slots": slots, "reserve_gib": reserve, "headroom_gib": 0}))
+        self.config.write_text(json.dumps({"slots": slots, "reserve_gib": reserve, "headroom_gib": 0, "idle_gib": reserve}))
 
     def cli(self, *args, cwd=None, check=True):
         return subprocess.run([sys.executable, str(QUEUE), *args], env=self.env, cwd=cwd or self.root,
@@ -84,14 +96,16 @@ class QueueTests(unittest.TestCase):
         other = self.root / "other"
         other.mkdir()
         waiting = self.submit("pass", other)
-        self.wait(lambda: "queued position=1/1" in self.cli("logs", waiting).stdout)
+        self.wait(lambda: "place 1 of 1 queued" in self.cli("logs", waiting).stdout)
         log = self.cli("logs", waiting).stdout
-        for expected in ("slots full", "memory available=", "required=0.0 GiB", "ETA unknown",
-                         f"id={holder}", f"pid={running['pgid']}", f"cwd={self.root.resolve()}", "command=", "running="):
+        for expected in ("waiting 0s", "slots full (1/1)", "GiB free, 0.0 GiB needed", "(HEAVY_CHECK_MAX_WAIT=900s)",
+                         f"ahead: {holder} running", f"in {self.root.name} (python3 -c"):
             self.assertIn(expected, log)
         same = self.submit("pass")
         self.wait(lambda: "same cwd already running" in self.cli("logs", same).stdout)
-        self.wait(lambda: "queued position=1/2" in self.cli("logs", waiting).stdout)
+        log = self.cli("logs", same).stdout
+        self.assertIn(f"place 2 of 2 queued; ahead: {holder} running", log)
+        self.assertIn(f"{waiting} queued", log)
         self.cli("cancel", waiting, cwd=other)
         self.assertEqual(self.finished(waiting)["code"], 130)
 
@@ -158,7 +172,7 @@ class QueueTests(unittest.TestCase):
         self.env["HEAVY_CHECK_TEST_ORIGINAL"] = "original"
         process, job = self.foreground("import os; print(os.environ['HEAVY_CHECK_TEST_ORIGINAL'])")
         self.env["HEAVY_CHECK_TEST_ORIGINAL"] = "changed"
-        self.wait(lambda: "queued position=" in self.cli("logs", job["id"]).stdout)
+        self.wait(lambda: "place 1 of 1" in self.cli("logs", job["id"]).stdout)
         os.kill(job["owner"], signal.SIGTERM)
         self.wait(lambda: self.jobs()[job["id"]]["recovery_reason"])
         retained = self.jobs()[job["id"]]
@@ -175,14 +189,79 @@ class QueueTests(unittest.TestCase):
         self.assertNotIn("environment", recovered)
         self.assertIn("restarted", stderr)
 
-    def test_dead_caller_does_not_own_or_cancel_worker(self):
+    def test_dead_foreground_caller_frees_its_place_in_line(self):
         self.configure(reserve=1000000)
         process, job = self.foreground()
         os.kill(process.pid, signal.SIGKILL)
         process.communicate(timeout=15)
-        self.assertEqual(self.jobs()[job["id"]]["state"], "queued")
+        final = self.finished(job["id"])
+        self.assertEqual((final["state"], final["code"]), ("cancelled", 130))
+        self.assertIn(f"caller pid={process.pid} exited while the job was queued", final["cancel_reason"])
+
+    def test_dead_foreground_caller_frees_its_slot(self):
+        self.configure(slots=1)
+        process, job = self.foreground("import time; time.sleep(30)")
+        self.wait(lambda: self.jobs()[job["id"]]["state"] == "running")
+        other = self.root / "other"
+        other.mkdir()
+        waiting = self.submit("pass", other)
+        os.kill(process.pid, signal.SIGKILL)
+        process.communicate(timeout=15)
+        self.assertIn("exited while the job was running", self.finished(job["id"])["cancel_reason"])
+        self.assertEqual(self.finished(waiting)["code"], 0)
+
+    def test_lone_job_needs_only_idle_memory(self):
+        # Nothing of ours is running, so headroom + reserve does not apply.
+        self.config.write_text(json.dumps({"slots": 2, "reserve_gib": 1000000, "headroom_gib": 1000000, "idle_gib": 0}))
+        self.assertEqual(self.cli("run", "--", sys.executable, "-c", "print('ran')").stdout.strip(), "ran")
+
+    def test_submitted_job_outlives_its_submitter(self):
+        self.configure(reserve=1000000)
+        job = self.submit("pass")
+        time.sleep(1.5)
+        self.assertEqual(self.jobs()[job]["state"], "queued")
         self.configure()
-        self.assertEqual(self.finished(job["id"])["code"], 0)
+        self.assertEqual(self.finished(job)["code"], 0)
+
+    def test_max_wait_fails_with_who_was_ahead_and_how_to_override(self):
+        self.configure(slots=1)
+        holder = self.submit("import time; time.sleep(30)")
+        self.wait(lambda: self.jobs()[holder]["state"] == "running")
+        other = self.root / "other"
+        other.mkdir()
+        self.env["HEAVY_CHECK_MAX_WAIT"] = "2"
+        started = time.monotonic()
+        result = self.cli("run", "--", sys.executable, "-c", "print('ran')", cwd=other, check=False)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertNotIn("ran", result.stdout)
+        for expected in ("timeout (exit 124): gave up after waiting 2s", "the command never started",
+                         f"Ahead of it:\n  {holder} running", "HEAVY_CHECK_MAX_WAIT=30m", "heavy-check status"):
+            self.assertIn(expected, result.stderr)
+        self.assertEqual(self.jobs()[holder]["state"], "running")
+
+    def test_bad_max_wait_fails_before_queueing(self):
+        self.env["HEAVY_CHECK_MAX_WAIT"] = "soon"
+        result = self.cli("run", "--", sys.executable, "-c", "pass", check=False)
+        self.assertEqual(result.returncode, 125)
+        self.assertIn("HEAVY_CHECK_MAX_WAIT='soon'", result.stderr)
+        self.assertEqual(self.jobs(), {})
+
+    def test_stray_slot_lock_holder_does_not_block_the_line(self):
+        self.configure(slots=1)
+        state = self.root / "state"
+        state.mkdir()
+        stray = open(state / "slot-0.lock", "a+")
+        self.addCleanup(stray.close)
+        fcntl.flock(stray, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = self.cli("run", "--", sys.executable, "-c", "print('ran')")
+        self.assertEqual(result.stdout.strip(), "ran")
+        self.assertIn("ignoring stray lock holders", result.stderr)
+
+    def test_command_does_not_inherit_the_slot_lock(self):
+        self.configure(slots=1)
+        result = self.cli("run", "--", "sh", "-c", "ls -l /proc/$$/fd 2>/dev/null || lsof -p $$")
+        self.assertNotIn("slot-", result.stdout)
 
     def test_running_worker_death_is_not_success_and_other_queued_jobs_survive(self):
         self.configure(slots=1)
@@ -357,6 +436,41 @@ class QueueMetadataTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.queue.ROOT = Path(self.temp.name)
 
+    def test_max_wait_parsing(self):
+        parse = self.queue.max_wait
+        self.assertEqual(parse({}), 900)
+        self.assertEqual(parse({"HEAVY_CHECK_MAX_WAIT": "90"}), 90)
+        self.assertEqual(parse({"HEAVY_CHECK_MAX_WAIT": "30m"}), 1800)
+        self.assertEqual(parse({"HEAVY_CHECK_MAX_WAIT": "1.5h"}), 5400)
+        self.assertIsNone(parse({"HEAVY_CHECK_MAX_WAIT": "0"}))
+        with self.assertRaises(ValueError):
+            parse({"HEAVY_CHECK_MAX_WAIT": "-5"})
+
+    def test_reap_times_out_a_job_whose_worker_never_will(self):
+        # A worker from an older install has no max wait; reap ends its wait instead.
+        with self.queue.database() as db:
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,environment)
+                VALUES ('old',?,'/x','["true"]','queued',?,?,'{}')""",
+                       (time.time() - 900 - 61, os.getpid(), self.queue.identity(os.getpid())))
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,environment)
+                VALUES ('patient',?,'/y','["true"]','queued',?,?,'{"HEAVY_CHECK_MAX_WAIT": "0"}')""",
+                       (time.time() - 99999, os.getpid(), self.queue.identity(os.getpid())))
+            self.queue.reap(db)
+            old = db.execute("SELECT * FROM jobs WHERE id='old'").fetchone()
+            self.assertEqual(old["cancel"], 1)
+            self.assertIn("past its max wait of 15m00s", old["cancel_reason"])
+            self.assertEqual(db.execute("SELECT cancel FROM jobs WHERE id='patient'").fetchone()[0], 0)
+
+    def test_dead_worker_of_a_cancelled_queued_job_is_not_restarted(self):
+        with self.queue.database() as db:
+            db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity,cancel)
+                VALUES ('gone',?,'/x','["true"]','queued',424242,'old',1)""", (time.time(),))
+            with mock.patch.object(self.queue, "launch") as launch:
+                self.queue.reap(db)
+            launch.assert_not_called()
+            job = db.execute("SELECT * FROM jobs WHERE id='gone'").fetchone()
+            self.assertEqual((job["state"], job["code"]), ("cancelled", 130))
+
     def test_legacy_database_is_migrated_without_losing_jobs(self):
         with sqlite3.connect(self.queue.ROOT / "queue.sqlite") as db:
             db.execute("""CREATE TABLE jobs (
@@ -390,8 +504,8 @@ class QueueMetadataTests(unittest.TestCase):
         queue = self.queue
         with queue.database() as db:
             db.execute("""INSERT INTO jobs (id,created,cwd,command,state,owner,identity)
-                VALUES ('waiting',0,?,'["unused"]','queued',?,?)""",
-                       (str(queue.ROOT), os.getpid(), queue.identity(os.getpid())))
+                VALUES ('waiting',?,?,'["unused"]','queued',?,?)""",
+                       (time.time(), str(queue.ROOT), os.getpid(), queue.identity(os.getpid())))
         ticks = iter((0.25, 30.5, 31))
         clock = [0]
         def advance(_):
@@ -401,7 +515,7 @@ class QueueMetadataTests(unittest.TestCase):
                     queue.request_cancel(db, "waiting", "first cancel", 123)
                     queue.request_cancel(db, "waiting", "second cancel", 456)
         stderr = io.StringIO()
-        config = {"slots": 1, "reserve_gib": 6, "headroom_gib": 4}
+        config = {"slots": 1, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 10}
         with mock.patch.object(queue, "settings", return_value=config), \
              mock.patch.object(queue, "available_gib", return_value=2.25), \
              mock.patch.object(queue, "watch_signals"), \
@@ -411,9 +525,9 @@ class QueueMetadataTests(unittest.TestCase):
              contextlib.redirect_stderr(stderr):
             self.assertEqual(queue.work("waiting"), 130)
         output = stderr.getvalue()
-        self.assertEqual(output.count("queued position=1/1"), 2)
-        self.assertIn("waiting for memory", output)
-        self.assertIn("available=2.2 GiB required=10.0 GiB", output)
+        self.assertEqual(output.count("place 1 of 1 queued"), 2)
+        self.assertIn("blocked by: memory", output)
+        self.assertIn("memory 2.2 GiB free, 10.0 GiB needed", output)
         self.assertIn("cancelled (exit 130): first cancel", output)
         with queue.database() as db:
             job = db.execute("SELECT * FROM jobs WHERE id='waiting'").fetchone()
@@ -447,18 +561,18 @@ class WiringTests(unittest.TestCase):
             root = Path(directory)
             (root / "sub").mkdir()
             (root / "package.json").write_text(json.dumps({"heavyCheck": {"selfQueued": ["check"]}}))
-            with contextlib.chdir(root / "sub"):
+            with chdir(root / "sub"):
                 self.assertFalse(module.heavy_bun(["run", "check", "--only", "nosuch"]))
                 self.assertFalse(module.heavy_bun(["run", "check", "--bogus"]))
                 self.assertTrue(module.heavy_bun(["run", "typecheck"]))
             other = root / "other"
             other.mkdir()
             (other / "package.json").write_text("{}")
-            with contextlib.chdir(other):
+            with chdir(other):
                 self.assertTrue(module.heavy_bun(["run", "check"]))
                 self.assertFalse(module.heavy_bun(["--cwd", str(root), "run", "check"]))
             (other / "package.json").write_text("not json")
-            with contextlib.chdir(other):
+            with chdir(other):
                 self.assertTrue(module.heavy_bun(["run", "check"]))
 
     def test_wiring_preserves_commands_and_is_idempotent(self):
