@@ -461,8 +461,8 @@ cmd_update() {
   # macOS box: no apt; Codex is an npm global there, and `t3 update` restarts its own launchd service
   # (com.box.t3-service-wrap then puts box-launch back in front of it). install-macbox refreshes the
   # heartbeat and reapers.
-  has_role $TARGET macbox && { ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; t3 update --yes; claude update; npm i -g @openai/codex@latest; bun upgrade; if [ -x "$HOME/.local/bin/install-heavy-checks" ]; then "$HOME/.local/bin/install-heavy-checks"; fi; ~/Documents/projects/box/mac/install-macbox'; return; }
-  ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade; if [ -x \"\$HOME/.local/bin/install-heavy-checks\" ]; then \"\$HOME/.local/bin/install-heavy-checks\"; fi" && systemctl --user restart t3code'
+  has_role $TARGET macbox && { ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; t3 update --yes; claude update; npm i -g @openai/codex@latest; bun upgrade; if [ -f "$HOME/.local/share/box/heavy-check-install.json" ]; then python3 ~/Documents/projects/box/bin/install-heavy-checks; fi; ~/Documents/projects/box/mac/install-macbox'; return; }
+  ont "$h" 'git -C ~/Documents/projects/box pull -q --ff-only; sudo apt-get update -qq && sudo apt-get upgrade -y && sh -lc "t3 update --yes; claude update; codex update; bun upgrade; if [ -f \"\$HOME/.local/share/box/heavy-check-install.json\" ]; then python3 ~/Documents/projects/box/bin/install-heavy-checks; fi" && systemctl --user restart t3code'
 }
 
 # What each machine is for, shown in `box help`.
