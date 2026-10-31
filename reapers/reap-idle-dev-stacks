@@ -20,7 +20,10 @@ else
   mtime() { stat -c %Y "$1"; }
   proc_cwd() { readlink "/proc/$1/cwd"; }
 fi
-is_dev_ts() { ps -o args= -p "$1" 2>/dev/null | grep -q 'scripts/dev.ts'; }
+# A `bun dev --detach` orchestrator runs as `bun --eval ...REVNU_DEV_ENTRYPOINT...` with no
+# scripts/dev.ts in its args (so another checkout's pkill can't hit it); missing that made every
+# detached stack's children "orphans" after 30 min (REV-2211).
+is_dev_ts() { ps -o args= -p "$1" 2>/dev/null | grep -qE 'scripts/dev\.ts|REVNU_DEV_ENTRYPOINT'; }
 # Seconds since a process started, from `ps -o etime` ([[dd-]hh:]mm:ss), which both have.
 proc_age() {
   ps -o etime= -p "$1" 2>/dev/null | awk '{n = split($1, a, /[-:]/); s = a[n] + a[n-1] * 60
