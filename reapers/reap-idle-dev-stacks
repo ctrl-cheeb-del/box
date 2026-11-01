@@ -78,10 +78,22 @@ for pidfile in "$HOME"/.t3/worktrees/*/*/.dev/*/dev.pid "$HOME"/projects/*/.dev/
   stop_group "$pid" "$pgid"
 done
 
-# 2. Orphans: stack processes with no live scripts/dev.ts among their ancestors.
-has_dev_ancestor() {
+# 2. Orphans: stack processes whose own checkout's orchestrator is not among their ancestors.
+# The orchestrator is found by the pid in that checkout's .dev/*/dev.pid, not by its args: how
+# `bun dev` names itself changes (--detach runs as `bun --eval`), and a name miss killed every live
+# detached stack hourly (REV-2211, REV-2394). The pid must still run in the checkout, so a stale
+# dev.pid whose pid was reused (by systemd, say) protects nothing.
+live_orchestrators() { # $1 = checkout root
+  local f p
+  for f in "$1"/.dev/*/dev.pid; do
+    p=$(tr -dc 0-9 < "$f" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && [ "$(proc_cwd "$p")" = "$1" ] && echo "$p"
+  done
+}
+has_dev_ancestor() { # $1 = pid, $2 = live orchestrator pids
   local p=$1
   while [ "$p" -gt 1 ] 2>/dev/null; do
+    case " $2 " in *" $p "*) return 0 ;; esac
     is_dev_ts "$p" && return 0
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$p" ] || return 1
   done
@@ -89,7 +101,6 @@ has_dev_ancestor() {
 }
 for pid in $(pgrep -f 'next-server|convex-local-backend|workerd|node_modules/.bin/(next|convex) dev'); do
   kill -0 "$pid" 2>/dev/null || continue
-  has_dev_ancestor "$pid" && continue
   age=$(proc_age "$pid"); [ "${age:-0}" -lt "$ORPHAN_MIN_AGE" ] && continue
   # Only directories that ran a `bun dev` stack; a plain `next dev` in another repo is not ours.
   # A process that exits after pgrep has no cwd; "" then made `dirname` loop on "." forever and
@@ -98,6 +109,7 @@ for pid in $(pgrep -f 'next-server|convex-local-backend|workerd|node_modules/.bi
   case $d in /*) ;; *) continue ;; esac
   while [ "$d" != / ] && ! compgen -G "$d/.dev/*/dev.pid" >/dev/null; do d=$(dirname "$d"); done
   [ "$d" = / ] && continue
+  has_dev_ancestor "$pid" "$(live_orchestrators "$d" | tr '\n' ' ')" && continue
   echo "killing orphan $pid ($(ps -o comm= -p "$pid")) in $cwd"
   run kill -TERM "$pid"
 done
