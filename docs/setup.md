@@ -288,9 +288,9 @@ normally. See [heavy-checks.md](heavy-checks.md) for configuration and rollback.
 A box never reboots, so leaks that a laptop clears by sleeping pile up. On 2026-10-02 forgotten
 `bun dev` stacks (3-5 GB each) filled skynet's memory and T3 stopped answering. Three guards:
 
-- **Reaper timers.** Copy the files in [`reapers/`](../reapers/): the three scripts to `~/.local/bin/`
-  (`chmod +x`), the six units to `~/.config/systemd/user/`, then
-  `systemctl --user daemon-reload && systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer reap-stale-tmp.timer`.
+- **Reaper timers.** Run [`reapers/install`](../reapers/install): it copies the scripts to `~/.local/bin/`
+  and the units to `~/.config/systemd/user/`, and enables the three timers. `box update` reruns it, so
+  reaper fixes reach every box.
   `reap-idle-dev-stacks` stops a stack with no activity for 8 hours and writes a `[reaper]` line to its
   `dev.log`; try `reap-idle-dev-stacks --dry-run`. `reap-convex-executors` kills Convex local-backend
   executors orphaned by a stopped backend. `reap-stale-tmp` runs hourly and removes top-level `/tmp`

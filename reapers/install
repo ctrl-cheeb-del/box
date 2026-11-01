@@ -1,0 +1,16 @@
+#!/bin/bash
+# Install or refresh the reapers on a Linux box: scripts to ~/.local/bin, units to
+# ~/.config/systemd/user, timers enabled. `box update` runs it, so a fix merged here reaches every
+# box (jarvis ran a reaper two fixes old for days and kept killing live stacks, REV-2394).
+# macOS boxes use mac/install-macbox instead.
+set -eu
+src=$(cd "$(dirname "$0")" && pwd)
+mkdir -p ~/.local/bin ~/.config/systemd/user
+for f in "$src"/reap-*; do
+  case $f in
+    *.service|*.timer) install -m 644 "$f" ~/.config/systemd/user/ ;;
+    *) install -m 755 "$f" ~/.local/bin/ ;;
+  esac
+done
+systemctl --user daemon-reload
+systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer reap-stale-tmp.timer
