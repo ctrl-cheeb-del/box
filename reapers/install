@@ -13,4 +13,4 @@ for f in "$src"/reap-*; do
   esac
 done
 systemctl --user daemon-reload
-systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer reap-stale-tmp.timer
+systemctl --user enable --now reap-convex-executors.timer reap-idle-dev-stacks.timer reap-stale-tmp.timer reap-merged-worktrees.timer

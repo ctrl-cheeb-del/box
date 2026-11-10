@@ -218,8 +218,8 @@ echo "tailscale   $(ok $ts)"
 echo "t3 connect  $(t3 connect status 2>/dev/null | grep -E 'Exposure' | sed 's/.*: //')"
 pmset -g | grep -q 'SleepDisabled[[:space:]]*1' && sl=active || sl="sleep is ON"
 echo "never sleep $(ok "$sl")"
-jobs=$(launchctl list | grep -c -E 'com\.box\.(t3-service-wrap|reap-convex-executors|reap-idle-dev-stacks|reap-stale-tmp|heartbeat)$')
-[ "$jobs" = 5 ] && js=active || js="$jobs/5 loaded (run mac/install-macbox)"
+jobs=$(launchctl list | grep -c -E 'com\.box\.(t3-service-wrap|reap-convex-executors|reap-idle-dev-stacks|reap-stale-tmp|reap-merged-worktrees|heartbeat)$')
+[ "$jobs" = 6 ] && js=active || js="$jobs/6 loaded (run mac/install-macbox)"
 echo "box jobs    $(ok "$js")"
 [ "$(plutil -extract ProgramArguments.0 raw -o - ~/Library/LaunchAgents/com.t3tools.t3code.service.plist 2>/dev/null)" = "$HOME/.local/libexec/box-launch" ] && w=active || w="not wrapped: ~/Documents prompts return"
 echo "t3 wrapped  $(ok "$w")"

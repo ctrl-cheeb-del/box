@@ -238,6 +238,21 @@ Install with the other user reapers ([setup](setup.md#9-keep-it-healthy)); previ
 `reap-stale-tmp --dry-run`, logs with `journalctl --user -u reap-stale-tmp`. Incomplete process visibility
 aborts cleanup; passwordless sudo is used only for the read-only `/proc` scan, never deletion.
 
+## Merged worktree reaper (2026-11-10)
+
+skynet's disk reached 77% (681 of 937 GB). The bulk was `~/.t3/worktrees/revnu2`: 424 worktrees, nearly all
+with their own `node_modules` (~0.5-2 GB each), most for PRs merged weeks earlier. A manual pass removed 306
+of them, plus caches, Docker build cache, 8 GB of `~/.config/.wrangler/logs`, disabled snap revisions and
+pokeheartgold's 127 GB `.local-tools/to90` scratch (its tooling and results kept in
+`.local-tools/to90-tooling.tar.gz`). Result: 45% (397 GB).
+`reap-merged-worktrees.timer` (daily) keeps it from coming back. It removes a worktree under `~/.t3/worktrees/*/`
+only when its branch's PR is merged or closed (none open), or its T3 thread is deleted and `HEAD` is on a remote;
+`git status` is empty; the tree, index and HEAD are 2 days idle (`IDLE_DAYS=`); and no process has its cwd inside.
+It deletes via `git worktree remove` without `--force`, reads git with `--no-optional-locks` (a plain `git status`
+rewrites the index and makes the tree look used), and an unreadable T3 database removes nothing. Without `gh`
+only the deleted-thread rule applies. Preview: `reap-merged-worktrees --dry-run --verbose`; logs:
+`journalctl --user -u reap-merged-worktrees` (Mac: `com.box.reap-merged-worktrees`, daily).
+
 ## Finding a thread across machines
 
 `box threads search boat.dev` searches every reachable machine, including this one. Results show
@@ -435,7 +450,7 @@ agent box like jarvis, but on macOS, so launchd instead of systemd and Screen Sh
 - **Heartbeat and reapers** (2026-10-28): the same scripts as the Linux boxes, now portable, run as launchd agents
   through box-launch, installed by `mac/install-macbox` (also run by `box update air`): `com.box.heartbeat` (30 min;
   Homebrew bash 5 for its associative arrays), `com.box.reap-convex-executors` (10 min), `com.box.reap-idle-dev-stacks`
-  (30 min), `com.box.reap-stale-tmp` (hourly; `/private/tmp` and the per-user `$TMPDIR`, open files via `sudo -n
+  (30 min), `com.box.reap-merged-worktrees` (daily), `com.box.reap-stale-tmp` (hourly; `/private/tmp` and the per-user `$TMPDIR`, open files via `sudo -n
   lsof`). Logs in `~/Library/Logs/box/` (`box logs air heartbeat`). The heartbeat on a Mac also alerts when sleep is back
   on or `~/Documents` is blocked by a privacy prompt. `~/.config/box/peers` is skynet + jarvis, and both list `air`.
   No zram: macOS compresses memory itself.

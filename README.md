@@ -28,7 +28,7 @@ box proxy | claude-login      CLIProxyAPI dashboard / add a Claude account (on t
 | `docs/setup.md` | building a box from scratch, every trap included, plus a prompt to hand the job to an agent |
 | `docs/add-a-device.md` | adding a laptop, phone or another box to this setup (copy-paste prompt inside) |
 | `docs/machines.md` | the running record: what's on each machine, where credentials live, past incidents |
-| `reapers/` | forgotten dev stacks, orphaned executors and stale /tmp trees: systemd user timers on Linux, launchd on a macOS box |
+| `reapers/` | forgotten dev stacks, orphaned executors, stale /tmp trees and T3 worktrees whose PR merged: systemd user timers on Linux, launchd on a macOS box |
 | `bin/heavy-check`, `bin/install-heavy-checks` | `heavy-check run/submit/status/logs`; `cancel [JOB_ID / --id JOB_ID / --pid PID]` targets this cwd; [Linux/macOS install and usage](docs/heavy-checks.md) |
 | `heartbeat/` | every 30 min each box posts "alive" to ntfy and alerts if a peer goes quiet or it's unhealthy |
 | `watch/` | babysits a few revnu creators every 3 hours and opens a T3 thread per problem (skynet) |

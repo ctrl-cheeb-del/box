@@ -1,0 +1,10 @@
+[Unit]
+Description=Reap merged T3 worktrees daily
+
+[Timer]
+# OnStartupSec, not OnBootSec: see reap-stale-tmp.timer.
+OnStartupSec=1h
+OnUnitActiveSec=1d
+
+[Install]
+WantedBy=timers.target
