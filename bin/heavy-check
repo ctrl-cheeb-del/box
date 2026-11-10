@@ -17,7 +17,7 @@ import shlex
 
 ROOT = Path(os.environ.get("HEAVY_CHECK_STATE", Path.home() / ".local/state/box/heavy-check")).absolute()
 CONFIG = Path(os.environ.get("HEAVY_CHECK_CONFIG", Path.home() / ".config/box/heavy-check.json")).absolute()
-DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 6}
+DEFAULTS = {"slots": 2, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 6, "io_full_pct": 20, "memory_full_pct": 5}
 STOP = None
 SIGNALS = {signal.SIGINT, signal.SIGTERM}
 HEARTBEAT = 30
@@ -33,7 +33,7 @@ def settings():
     config = DEFAULTS | (json.loads(CONFIG.read_text()) if CONFIG.exists() else {})
     if not isinstance(config["slots"], int) or not 1 <= config["slots"] <= 32:
         raise ValueError("slots must be an integer from 1 to 32")
-    for key in ("reserve_gib", "headroom_gib", "idle_gib"):
+    for key in ("reserve_gib", "headroom_gib", "idle_gib", "io_full_pct", "memory_full_pct"):
         if not isinstance(config[key], (int, float)) or config[key] < 0:
             raise ValueError(f"{key} must be a nonnegative number")
     return config
@@ -78,8 +78,54 @@ def available_gib():
         raise RuntimeError("heavy-check supports Linux and macOS")
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) / 1048576
+            return min(int(line.split()[1]) / 1048576, cgroup_available_gib())
     raise RuntimeError("MemAvailable missing from /proc/meminfo")
+
+
+def cgroup_available_gib(root=Path("/sys/fs/cgroup"), membership=Path("/proc/self/cgroup")):
+    """Respect every ancestor limit; host MemAvailable can hide cgroup reclaim."""
+    try:
+        group = next(line[3:] for line in membership.read_text().splitlines() if line.startswith("0::"))
+        directory = root / group.lstrip("/")
+        limits = []
+        while directory == root or root in directory.parents:
+            if not (directory / "memory.current").exists():
+                break
+            current = int((directory / "memory.current").read_text())
+            for name in ("memory.high", "memory.max"):
+                value = (directory / name).read_text().strip()
+                if value != "max":
+                    limits.append(max(0, int(value) - current) / 1073741824)
+            if directory == root:
+                break
+            directory = directory.parent
+        return min(limits, default=float("inf"))
+    except (OSError, ValueError, StopIteration):
+        return float("inf")
+
+
+def pressure_blocks(config, root=Path("/proc/pressure")):
+    """Pause new admissions during sustained stalls, never cancel existing work."""
+    blocks = ["maintenance pause"] if config.get("paused", False) else []
+    if sys.platform != "linux":
+        return blocks
+    for resource, key in (("io", "io_full_pct"), ("memory", "memory_full_pct")):
+        try:
+            line = next(line for line in (root / resource).read_text().splitlines() if line.startswith("full "))
+            values = dict(word.split("=", 1) for word in line.split()[1:])
+            value = float(values["avg10"])
+            if value > config[key]:
+                blocks.append(f"{resource} pressure {value:.1f}% > {config[key]:g}%")
+        except (OSError, ValueError, KeyError, StopIteration):
+            pass  # PSI is optional on older kernels.
+    return blocks
+
+
+def heavy_npx(args):
+    if any(arg in ("--help", "-h", "--version", "-v") for arg in args):
+        return False
+    words = positional(args)
+    return bool(words and words[0].split("@", 1)[0] in {"tsc", "typescript"})
 
 
 def identity(pid):
@@ -204,7 +250,7 @@ def nested():
 
 VALUE_FLAGS = {"--cwd", "-C", "--filter", "--env-file", "--config", "-c", "--preload", "-r",
                "--timeout", "--test-name-pattern", "-t", "--reporter", "--reporter-outfile",
-               "--coverage-reporter", "--coverage-dir", "--concurrent", "--max-concurrency"}
+               "--coverage-reporter", "--coverage-dir", "--concurrent", "--max-concurrency", "--package", "-p"}
 
 
 def positional(args):
@@ -250,13 +296,17 @@ def heavy_bun(args):
     if command == "run":
         if len(words) > 1 and self_queued(args, words[1]):
             return False
-        return len(words) > 1 and words[1].split(":", 1)[0] in {"check", "typecheck", "build", "test"}
+        return len(words) > 1 and words[1].split(":", 1)[0] in {"check", "typecheck", "build", "test", "tsc"}
+    if command in {"install", "i", "update", "add", "remove"}:
+        return True
     if command == "test":
         # A named file or test-name filter is a targeted test; let it run freely.
         return len(words) == 1 and not any(arg == "-t" or arg.startswith("--test-name-pattern") for arg in args)
     if command == "x":
         return len(words) > 1 and words[1].split("@", 1)[0] == "tsc"
-    return command.split(":", 1)[0] in {"check", "typecheck", "build", "test"}
+    if Path(command).name in {"check.ts", "tsc-first-cause.ts", "tsc", "tsc.js"}:
+        return True
+    return command.split(":", 1)[0] in {"check", "typecheck", "build", "test", "tsc"}
 
 
 def stop(signum, frame):
@@ -334,12 +384,12 @@ def describe(job, now):
     return f"{job['id']} {age} in {Path(job['cwd']).name} ({text})"
 
 
-def queue_notice(db, job, config, available, required, now, limit):
+def queue_notice(db, job, config, available, required, now, limit, pressure=()):
     queued = db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created,id").fetchall()
     running = db.execute("SELECT * FROM jobs WHERE state='running' ORDER BY started,id").fetchall()
     eligible = [q for q in queued if not any(r["cwd"] == q["cwd"] for r in running)]
     position = next(i + 1 for i, q in enumerate(queued) if q["id"] == job["id"])
-    gates = []
+    gates = list(pressure)
     if any(r["cwd"] == job["cwd"] for r in running):
         gates.append("same cwd already running")
     if any(q["id"] == job["id"] for q in eligible) and eligible[0]["id"] != job["id"]:
@@ -470,7 +520,8 @@ def work(job_id):
                 # so the lone job only needs its own working memory.
                 required = (config["headroom_gib"] + config["reserve_gib"] * (1 + young) if running
                             else config["idle_gib"])
-                enough = available >= required
+                pressure = pressure_blocks(config)
+                enough = available >= required and not pressure
                 same_checkout = db.execute("SELECT 1 FROM jobs WHERE state='running' AND cwd=?", (job["cwd"],)).fetchone()
                 if first and first["id"] == job_id and enough and not same_checkout and running < config["slots"]:
                     # The count above is the real limit. The lock files only keep workers from
@@ -496,7 +547,7 @@ def work(job_id):
                                (child.pid, identity(child.pid), time.time(), job_id))
                 if child is None:
                     now = time.time()
-                    snapshot, line, ahead = queue_notice(db, job, config, available, required, now, limit)
+                    snapshot, line, ahead = queue_notice(db, job, config, available, required, now, limit, pressure)
                     if limit and now - job["created"] >= limit:
                         state, code = "timeout", 124
                         failure_reason = timeout_message(ahead, line, limit, now)
@@ -551,14 +602,15 @@ def work(job_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["run", "submit", "status", "logs", "cancel", "_work", "bun"])
+    parser.add_argument("action", choices=["run", "submit", "status", "logs", "cancel", "_work", "bun", "npx"])
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.action == "bun":
+    if args.action in ("bun", "npx"):
         command = args.args[1:] if args.args[:1] == ["--"] else args.args
         if not command:
             parser.error("bun dispatcher requires the original executable")
-        if not heavy_bun(command[1:]):
+        classifier = heavy_bun if args.action == "bun" else heavy_npx
+        if not classifier(command[1:]):
             os.execv(command[0], command)
         args.action, args.args = "run", command
     settings()

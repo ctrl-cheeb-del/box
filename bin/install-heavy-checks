@@ -23,7 +23,7 @@ def atomic_copy(source, target):
         Path(temp).unlink(missing_ok=True)
 
 
-def install(home, bun, uninstall=False):
+def install(home, bun, uninstall=False, npx=None):
     manifest = home / ".local/share/box/heavy-check-install.json"
     if uninstall:
         data = json.loads(manifest.read_text())
@@ -31,6 +31,12 @@ def install(home, bun, uninstall=False):
         if MARKER.encode() not in bun.read_bytes()[:256]:
             raise ValueError("Bun launcher has changed; refusing to overwrite it")
         atomic_copy(original, bun)
+        if data.get("npx_wrapper"):
+            wrapper = Path(data["npx_wrapper"])
+            if wrapper.is_file() and b"# box-heavy-check-npx-v1" in wrapper.read_bytes()[:256]:
+                wrapper.unlink()
+        if data.get("npx_entry"):
+            os.replace(data["npx_backup"], data["npx_entry"])
         manifest.unlink()
         print(f"Restored original Bun at {bun}")
         return
@@ -60,8 +66,43 @@ def install(home, bun, uninstall=False):
         os.replace(temp, bun)
     finally:
         Path(temp).unlink(missing_ok=True)
+    data = json.loads(manifest.read_text()) if manifest.exists() else {}
+    if npx is not None:
+        npx = npx.absolute()
+        original_npx = npx.resolve()
+        wrapper = home / ".local/bin/npx"
+        if wrapper.exists() and b"# box-heavy-check-npx-v1" not in wrapper.read_bytes()[:256]:
+            raise ValueError(f"refusing to overwrite unknown npx launcher: {wrapper}")
+        if original_npx == wrapper.resolve():
+            if data.get("npx_entry") == str(npx):
+                original_npx = Path(data["npx_backup"]).resolve()
+            else:
+                raise ValueError("--npx must name the original npx executable")
+        # Some PATHs put Node's bin before ~/.local/bin. Guard that entry too
+        # when user-writable, preserving the executable/symlink for uninstall.
+        if os.access(npx.parent, os.W_OK) and npx != wrapper:
+            backup = npx.with_name(npx.name + ".heavy-check-original")
+            if data.get("npx_entry") != str(npx):
+                if backup.exists() or backup.is_symlink():
+                    raise ValueError(f"refusing to overwrite npx backup: {backup}")
+                os.replace(npx, backup)
+            original_npx = backup.resolve()
+            data.update(npx_entry=str(npx), npx_backup=str(backup))
+        text = ("#!/bin/sh\n# box-heavy-check-npx-v1\n"
+                f"exec {shlex.quote(str(runner))} npx -- {shlex.quote(str(original_npx))} \"$@\"\n")
+        fd, temporary = tempfile.mkstemp(prefix=".heavy-npx-", dir=wrapper.parent)
+        with os.fdopen(fd, "w") as file:
+            file.write(text)
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, wrapper)
+        data["npx_wrapper"] = str(wrapper)
+        if data.get("npx_entry") == str(npx):
+            link = npx.with_name(npx.name + ".heavy-check-link")
+            link.unlink(missing_ok=True)
+            link.symlink_to(wrapper)
+            os.replace(link, npx)
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps({"bun": str(bun), "original": str(original)}, indent=2) + "\n")
+    manifest.write_text(json.dumps(data | {"bun": str(bun), "original": str(original)}, indent=2) + "\n")
     print(f"Automatic heavy-check queue enabled: {bun}")
 
 
@@ -70,5 +111,6 @@ if __name__ == "__main__":
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--bun", type=Path)
     parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--npx", type=Path, help="original npx executable; install a ~/.local/bin guard")
     args = parser.parse_args()
-    install(args.home, args.bun or args.home / ".bun/bin/bun", args.uninstall)
+    install(args.home, args.bun or args.home / ".bun/bin/bun", args.uninstall, args.npx)

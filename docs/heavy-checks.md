@@ -9,6 +9,8 @@ package installation, or network service is involved.
 
 ```sh
 python3 bin/install-heavy-checks
+# Also guard npx tsc (pass the original npx, not an existing wrapper):
+python3 bin/install-heavy-checks --npx /usr/bin/npx
 ```
 
 This installs the runner to `~/.local/bin/heavy-check` and atomically wraps the
@@ -23,9 +25,12 @@ native `bun build`, full `bun test`, and `bunx tsc` / `bun x tsc`.
 This works for **existing and future worktrees, and other projects**, without
 editing their package files or committing a wrapper to each repository.
 
-`bun install`, dev servers, lint, ordinary scripts, version/help queries, and
+Dependency writes (`bun install`/`i`, `add`, `remove`, `update`) and direct `check.ts` /
+`tsc-first-cause.ts` invocations also queue. With `--npx` installed, `npx tsc` queues too.
+
+Dev servers, lint, ordinary scripts, version/help queries, and
 **targeted** native tests (`bun test path.test.ts` or `bun test -t pattern`) bypass
-the queue. Direct Node/tsc invocations or the preserved native Bun binary also
+the queue. Direct Node/tsc invocations, `npm exec tsc`, or the preserved native Bun binary still
 bypass it; this is a launcher guard, not an OS-wide memory limit.
 
 The original `wire-heavy-checks PROJECT --apply` is still available as an optional
@@ -99,8 +104,10 @@ use ramps up. With none running, nothing of the queue's can grow into the headro
 so the first job needs only `idle_gib` (6 GiB). That is what stops the queue starving
 at 8 GiB free with nothing running. This is an admission
 check, **not a hard memory limit**; a command can still exceed the estimate and
-unrelated processes can consume memory after admission. Linux uses `MemAvailable`;
-macOS estimates reclaimable memory from free, inactive, and speculative VM pages,
+unrelated processes can consume memory after admission. Linux uses the smaller of `MemAvailable` and memory remaining before any ancestor
+cgroup `memory.high`/`memory.max` limit. New admissions also wait when Linux PSI
+reports full I/O stalls above 20% or full memory stalls above 5% over ten seconds.
+These gates pause admission even if no queued job is running. macOS estimates reclaimable memory from free, inactive, and speculative VM pages,
 and pauses admission only at critical memory pressure (a busy Mac sits at "warn" for
 hours, and the page count already shrinks then). The queue does not stop
 already-running, unwrapped processes.
@@ -108,7 +115,7 @@ already-running, unwrapped processes.
 Configure `~/.config/box/heavy-check.json` (changes affect the next admission):
 
 ```json
-{"slots": 2, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 6}
+{"slots": 2, "reserve_gib": 6, "headroom_gib": 4, "idle_gib": 6, "io_full_pct": 20, "memory_full_pct": 5}
 ```
 
 Queue metadata, slot locks, and background logs live in
@@ -173,3 +180,13 @@ do not take production slots or change the production memory thresholds.
 The separate probe deliberately uses the real default queue and an unmodified
 temporary package. If it waits for memory or a slot, the probe cancels its own job;
 otherwise it runs only `echo`. It never starts a project build.
+
+Skynet uses one slot and more conservative memory/pressure thresholds after the
+2026-11-06 overload. `paused: true` temporarily pauses Linux admissions during
+maintenance; clear it to resume. Existing running jobs are not stopped.
+
+To reserve CPU for Skynet’s desktop and SSH, its managed agent slice also has
+`CPUQuota=800%` (eight of twelve CPUs), set persistently with
+`systemctl --user set-property app-t3code-agents.slice CPUQuota=800%`. This bounds
+CPU use even for a command that bypasses the queue; it does not replace admission
+control or govern processes outside that slice.

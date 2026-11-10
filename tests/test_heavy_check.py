@@ -42,7 +42,7 @@ class QueueTests(unittest.TestCase):
         self.ids = []
 
     def configure(self, slots=2, reserve=0):
-        self.config.write_text(json.dumps({"slots": slots, "reserve_gib": reserve, "headroom_gib": 0, "idle_gib": reserve}))
+        self.config.write_text(json.dumps({"slots": slots, "reserve_gib": reserve, "headroom_gib": 0, "idle_gib": reserve, "io_full_pct": 100, "memory_full_pct": 100}))
 
     def cli(self, *args, cwd=None, check=True):
         return subprocess.run([sys.executable, str(QUEUE), *args], env=self.env, cwd=cwd or self.root,
@@ -89,6 +89,15 @@ class QueueTests(unittest.TestCase):
         self.ids.append(job["id"])
         return process, job
 
+    def test_pause_blocks_admission_until_cleared(self):
+        config = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps(config | {"paused": True}))
+        job = self.submit("print('admitted')")
+        self.wait(lambda: "maintenance pause" in self.cli("logs", job).stdout)
+        self.assertEqual(self.jobs()[job]["state"], "queued")
+        self.config.write_text(json.dumps(config))
+        self.assertEqual(self.finished(job)["code"], 0)
+
     def test_queue_diagnostics_show_position_holders_memory_and_changes(self):
         self.configure(slots=1)
         holder = self.submit("import time; time.sleep(30)")
@@ -99,7 +108,7 @@ class QueueTests(unittest.TestCase):
         self.wait(lambda: "place 1 of 1 queued" in self.cli("logs", waiting).stdout)
         log = self.cli("logs", waiting).stdout
         for expected in ("waiting 0s", "slots full (1/1)", "GiB free, 0.0 GiB needed", "(HEAVY_CHECK_MAX_WAIT=900s)",
-                         f"ahead: {holder} running", f"in {self.root.name} (python3 -c"):
+                         f"ahead: {holder} running", f"in {self.root.name} ({Path(sys.executable).name} -c"):
             self.assertIn(expected, log)
         same = self.submit("pass")
         self.wait(lambda: "same cwd already running" in self.cli("logs", same).stdout)
@@ -212,7 +221,7 @@ class QueueTests(unittest.TestCase):
 
     def test_lone_job_needs_only_idle_memory(self):
         # Nothing of ours is running, so headroom + reserve does not apply.
-        self.config.write_text(json.dumps({"slots": 2, "reserve_gib": 1000000, "headroom_gib": 1000000, "idle_gib": 0}))
+        self.config.write_text(json.dumps({"slots": 2, "reserve_gib": 1000000, "headroom_gib": 1000000, "idle_gib": 0, "io_full_pct": 100, "memory_full_pct": 100}))
         self.assertEqual(self.cli("run", "--", sys.executable, "-c", "print('ran')").stdout.strip(), "ran")
 
     def test_submitted_job_outlives_its_submitter(self):
@@ -421,7 +430,20 @@ class QueueTests(unittest.TestCase):
         native_help = subprocess.run([str(bun), "x", "--help"], text=True, capture_output=True, timeout=15)
         self.assertEqual(alias_help.returncode, native_help.returncode)
         self.assertIn("bunx", alias_help.stderr + alias_help.stdout)
+        original_npx = self.root / "fake-npx"
+        original_npx.write_text("#!/bin/sh\necho npx-ok\n")
+        original_npx.chmod(0o755)
+        subprocess.run(installer + ["--npx", str(original_npx)], check=True, capture_output=True)
+        subprocess.run(installer + ["--npx", str(original_npx)], check=True, capture_output=True)
+        guarded_npx = home / ".local/bin/npx"
+        result = subprocess.run([str(guarded_npx), "tsc", "--noEmit"], cwd=self.root,
+                                env=self.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("npx-ok", result.stdout)
+        self.assertEqual(len(self.jobs()), 2)
         subprocess.run(installer + ["--uninstall"], check=True, capture_output=True)
+        self.assertFalse(guarded_npx.exists())
+        self.assertIn("echo npx-ok", original_npx.read_text())
         self.assertNotIn(b"box-heavy-check-launcher-v1", executable.read_bytes()[:256])
         subprocess.run([str(executable), "--version"], check=True, capture_output=True)
 
@@ -435,6 +457,42 @@ class QueueMetadataTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.queue.ROOT = Path(self.temp.name)
+
+    def test_cgroup_headroom_uses_tightest_ancestor(self):
+        root = self.queue.ROOT / "cgroup"
+        leaf = root / "parent" / "child"
+        leaf.mkdir(parents=True)
+        for directory, current, high, maximum in (
+            (root, 12, "max", "max"), (leaf.parent, 10, 12, 16), (leaf, 3, 8, 10)
+        ):
+            for name, value in (("current", current), ("high", high), ("max", maximum)):
+                (directory / f"memory.{name}").write_text(str(value if value == "max" else value * 1073741824))
+        membership = self.queue.ROOT / "membership"
+        membership.write_text("0::/parent/child\n")
+        self.assertEqual(self.queue.cgroup_available_gib(root, membership), 2)
+        (root / "memory.current").unlink()
+        self.assertEqual(self.queue.cgroup_available_gib(root, membership), 2)
+        (leaf.parent / "memory.current").write_text(str(13 * 1073741824))
+        self.assertEqual(self.queue.cgroup_available_gib(root, membership), 0)
+
+    def test_pressure_blocks_and_missing_psi(self):
+        root = self.queue.ROOT / "pressure"
+        root.mkdir()
+        with mock.patch.object(self.queue.sys, "platform", "linux"):
+            self.assertEqual(self.queue.pressure_blocks(self.queue.DEFAULTS, root), [])
+            (root / "io").write_text("some avg10=99.0\nfull avg10=30.0 avg60=0 total=1\n")
+            (root / "memory").write_text("full avg10=8.0 avg60=0 total=1\n")
+            self.assertEqual(len(self.queue.pressure_blocks(self.queue.DEFAULTS, root)), 2)
+            (root / "io").write_text("full avg10=0.0\n")
+            (root / "memory").write_text("full avg10=0.0\n")
+            self.assertEqual(self.queue.pressure_blocks(self.queue.DEFAULTS, root), [])
+            self.assertEqual(self.queue.pressure_blocks(self.queue.DEFAULTS | {"paused": True}, root), ["maintenance pause"])
+
+    def test_npx_dispatch(self):
+        for args in (["tsc", "--noEmit"], ["--yes", "tsc"], ["--package", "typescript", "tsc"]):
+            self.assertTrue(self.queue.heavy_npx(args))
+        for args in (["convex", "dev"], ["tsc", "--help"], ["eslint", "."]):
+            self.assertFalse(self.queue.heavy_npx(args))
 
     def test_max_wait_parsing(self):
         parse = self.queue.max_wait
@@ -543,10 +601,11 @@ class WiringTests(unittest.TestCase):
         loader.exec_module(module)
         for args in (["run", "check"], ["run", "--silent", "typecheck:scripts"],
                      ["--cwd", "/project", "run", "build"], ["run", "--filter", "*", "test"],
-                     ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"]):
+                     ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"], ["install"], ["install", "--frozen-lockfile"], ["run", "tsc", "--noEmit"],
+                     ["node_modules/typescript7/bin/tsc", "--noEmit"], ["scripts/tsc-first-cause.ts"]):
             with self.subTest(args=args):
                 self.assertTrue(module.heavy_bun(args))
-        for args in (["--version"], ["install"], ["run", "dev"], ["run", "lint"],
+        for args in (["--version"], ["run", "dev"], ["run", "lint"],
                      ["scripts/small.ts"], ["test", "unit.test.ts"],
                      ["test", "-t", "one test"], ["run", "check", "--help"]):
             with self.subTest(args=args):
