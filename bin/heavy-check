@@ -267,9 +267,11 @@ def positional(args):
     return result
 
 
-def self_queued(args, script):
+def self_queued(args, script, file=False):
     """A project lists scripts that validate their own arguments and then call
-    `heavy-check run` themselves, so a usage error never waits for a slot."""
+    `heavy-check run` themselves, so a usage error never waits for a slot.
+    An entry is a package.json script name, or a file path from the package root
+    for the file that script runs (`bun run check` runs `bun scripts/check.ts`)."""
     directory = Path(os.getcwd())
     for flag in ("--cwd", "-C"):
         if flag in args[:-1]:
@@ -281,7 +283,12 @@ def self_queued(args, script):
                 listed = json.loads(package.read_text()).get("heavyCheck", {}).get("selfQueued", [])
             except (OSError, ValueError, AttributeError):
                 return False
-            return isinstance(listed, list) and script in listed
+            if not isinstance(listed, list):
+                return False
+            if not file:
+                return script in listed
+            path, root = (directory / script).resolve(), folder.resolve()
+            return root in path.parents and str(path.relative_to(root)) in listed
     return False
 
 
@@ -305,7 +312,7 @@ def heavy_bun(args):
     if command == "x":
         return len(words) > 1 and words[1].split("@", 1)[0] == "tsc"
     if Path(command).name in {"check.ts", "tsc-first-cause.ts", "tsc", "tsc.js"}:
-        return True
+        return not self_queued(args, command, file=True)
     return command.split(":", 1)[0] in {"check", "typecheck", "build", "test", "tsc"}
 
 

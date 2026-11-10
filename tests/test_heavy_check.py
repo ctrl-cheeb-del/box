@@ -619,11 +619,20 @@ class WiringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sub").mkdir()
-            (root / "package.json").write_text(json.dumps({"heavyCheck": {"selfQueued": ["check"]}}))
+            (root / "package.json").write_text(json.dumps(
+                {"heavyCheck": {"selfQueued": ["check", "scripts/check.ts"]}}))
             with chdir(root / "sub"):
                 self.assertFalse(module.heavy_bun(["run", "check", "--only", "nosuch"]))
                 self.assertFalse(module.heavy_bun(["run", "check", "--bogus"]))
                 self.assertTrue(module.heavy_bun(["run", "typecheck"]))
+            # `bun run check` runs `bun scripts/check.ts`; its --fast mode must not queue.
+            with chdir(root):
+                self.assertFalse(module.heavy_bun(["--no-env-file", "scripts/check.ts", "--fast"]))
+                self.assertFalse(module.heavy_bun([str(root / "scripts/check.ts")]))
+                self.assertTrue(module.heavy_bun(["other/check.ts"]))
+            with chdir(root / "sub"):
+                self.assertFalse(module.heavy_bun(["../scripts/check.ts"]))
+                self.assertTrue(module.heavy_bun(["scripts/check.ts"]))
             other = root / "other"
             other.mkdir()
             (other / "package.json").write_text("{}")

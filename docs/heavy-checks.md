@@ -28,6 +28,11 @@ editing their package files or committing a wrapper to each repository.
 Dependency writes (`bun install`/`i`, `add`, `remove`, `update`) and direct `check.ts` /
 `tsc-first-cause.ts` invocations also queue. With `--npx` installed, `npx tsc` queues too.
 
+A project whose check queues its own heavy half lists it in `package.json`
+`heavyCheck.selfQueued`, by script name (`"check"`) and by the file that script runs
+(`"scripts/check.ts"`, from the package root). Listed ones bypass the launcher, so their
+light steps and light modes (revnu2's `check --fast`) never wait for a slot.
+
 Dev servers, lint, ordinary scripts, version/help queries, and
 **targeted** native tests (`bun test path.test.ts` or `bun test -t pattern`) bypass
 the queue. Direct Node/tsc invocations, `npm exec tsc`, or the preserved native Bun binary still
