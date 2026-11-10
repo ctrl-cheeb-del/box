@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Remove T3 worktrees whose work has landed, so they stop piling up on disk.
+
+A worktree under ~/.t3/worktrees/<project>/ is removed only when all of these hold:
+  - its branch's PR is merged or closed, OR its T3 thread is deleted and every commit is on a remote;
+  - `git status` is empty (no tracked edits, no untracked files that aren't ignored);
+  - neither the worktree nor its git index changed for IDLE_DAYS (default 2);
+  - no process has its working directory inside it.
+Removal goes through `git worktree remove` (never --force), which refuses a dirty tree on its own.
+skynet had 424 revnu2 worktrees on 2026-11-10, ~110 GB of them merged or abandoned.
+
+Usage: reap-merged-worktrees [--dry-run]. Linux and macOS.
+"""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = Path.home()
+T3 = Path(os.environ.get("T3CODE_HOME", str(HOME / ".t3")))
+ROOT = T3 / "worktrees"
+DB = T3 / "userdata/statev2.sqlite"
+IDLE_DAYS = float(os.environ.get("IDLE_DAYS", "2"))
+# systemd and launchd start us without a login shell, so gh's usual PATH entries are missing.
+EXTRA_PATH = [HOME / ".local/bin", HOME / ".bun/bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+
+
+def git(path, *args, timeout=120):
+    # --no-optional-locks: a plain `git status` rewrites the index, which would make every worktree
+    # we inspect look freshly used at the next run.
+    return subprocess.run(["git", "--no-optional-locks", "-C", str(path), *args], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def thread_states(db=DB):
+    """worktree path -> set of 'live' / 'archived' / 'deleted' for the T3 threads that use it."""
+    states = {}
+    if not db.is_file():
+        return states
+
+    def add(path, archived, deleted):
+        if path:
+            states.setdefault(path, set()).add("deleted" if deleted else "archived" if archived else "live")
+
+    with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=5) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "projection_threads" in tables:
+            for path, archived, deleted in conn.execute(
+                    "SELECT worktree_path, archived_at, deleted_at FROM projection_threads"):
+                add(path, archived, deleted)
+        if "orchestration_v2_projection_threads" in tables:
+            for archived, deleted, payload in conn.execute(
+                    "SELECT archived_at, deleted_at, payload_json FROM orchestration_v2_projection_threads"):
+                add(json.loads(payload).get("worktreePath"), archived, deleted)
+    return states
+
+
+def pr_states(repo):
+    """branch -> set of PR states for the repo at `repo`, or None when gh is unusable."""
+    gh = shutil.which("gh", path=os.pathsep.join([os.environ.get("PATH", "")] + [str(p) for p in EXTRA_PATH]))
+    if not gh:
+        return None
+    states = {}
+    for state in ("merged", "closed", "open"):
+        result = subprocess.run([gh, "pr", "list", "--state", state, "--limit", "5000",
+                                 "--json", "headRefName"], cwd=repo, capture_output=True, text=True, timeout=300)
+        if result.returncode:
+            print(f"gh pr list failed in {repo}: {result.stderr.strip()}", file=sys.stderr)
+            return None
+        for pr in json.loads(result.stdout):
+            states.setdefault(pr["headRefName"], set()).add(state)
+    return states
+
+
+def process_cwds():
+    if sys.platform == "darwin":
+        out = subprocess.run(["lsof", "-w", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True,
+                             timeout=120).stdout
+        return {line[1:] for line in out.splitlines() if line.startswith("n")}
+    cwds = set()
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                cwds.add(os.readlink(f"/proc/{pid}/cwd"))
+            except OSError:
+                pass
+    return cwds
+
+
+def last_change(path):
+    newest = path.stat().st_mtime
+    gitdir = git(path, "rev-parse", "--absolute-git-dir").stdout.strip()
+    for name in ("index", "HEAD", "logs/HEAD"):
+        try:
+            newest = max(newest, os.stat(os.path.join(gitdir, name)).st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def verdict(path, threads, prs, cwds, cutoff):
+    """(remove?, reason) for one worktree."""
+    if git(path, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
+        return False, "not a git worktree"
+    if any(c == str(path) or c.startswith(str(path) + "/") for c in cwds):
+        return False, "a process is using it"
+    if last_change(path) > cutoff:
+        return False, f"changed in the last {IDLE_DAYS:g} days"
+    status = git(path, "status", "--porcelain")
+    if status.returncode or status.stdout.strip():
+        return False, "uncommitted or untracked files"
+    branch = git(path, "branch", "--show-current").stdout.strip()
+    pr = (prs or {}).get(branch, set()) if branch else set()
+    if "open" in pr:
+        return False, "PR still open"
+    if pr & {"merged", "closed"}:
+        return True, "PR " + ("merged" if "merged" in pr else "closed")
+    states = threads.get(str(path), set())
+    if states and states <= {"deleted"}:
+        unpushed = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
+        if unpushed.returncode == 0 and unpushed.stdout.strip() == "0":
+            return True, "thread deleted, nothing unpushed"
+        return False, "thread deleted but has unpushed commits"
+    return False, "no merged PR"
+
+
+def main(argv=None, root=ROOT, db=DB):
+    parser = argparse.ArgumentParser(description="Remove T3 worktrees whose work has landed.")
+    parser.add_argument("--dry-run", action="store_true", help="list what would go without removing anything")
+    parser.add_argument("--verbose", action="store_true", help="also print every kept worktree and why")
+    args = parser.parse_args(argv)
+    if not root.is_dir():
+        print(f"no worktrees at {root}")
+        return 0
+
+    lockdir = Path(os.environ.get("XDG_RUNTIME_DIR", str(HOME / ".cache")))
+    lockdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (lockdir / "reap-merged-worktrees.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another reap-merged-worktrees is running, skipped")
+            return 0
+        try:
+            threads = thread_states(db)
+        except (sqlite3.Error, ValueError) as exc:
+            print(f"cannot read T3 threads; removed nothing: {exc}", file=sys.stderr)
+            return 1
+        cutoff = time.time() - IDLE_DAYS * 86400
+        removed, kept, failed = 0, {}, 0
+        for project in sorted(p for p in root.iterdir() if p.is_dir()):
+            trees = sorted(p for p in project.iterdir() if p.is_dir() and (p / ".git").is_file())
+            if not trees:
+                continue
+            common = git(trees[0], "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+            repo = Path(common).parent if common else trees[0]
+            prs = pr_states(trees[0])
+            touched = False
+            for path in trees:
+                # Read cwds per worktree: a long run must not miss an agent that started meanwhile.
+                ok, reason = verdict(path, threads, prs, process_cwds(), cutoff)
+                if not ok:
+                    kept[reason] = kept.get(reason, 0) + 1
+                    if args.verbose:
+                        print(f"kept {path}: {reason}")
+                    continue
+                if args.dry_run:
+                    print(f"would remove {path} ({reason})")
+                    removed += 1
+                    continue
+                result = git(repo, "worktree", "remove", str(path), timeout=1800)
+                if result.returncode:
+                    failed += 1
+                    print(f"failed to remove {path}: {result.stderr.strip()}", file=sys.stderr)
+                else:
+                    removed += 1
+                    touched = True
+                    print(f"removed {path} ({reason})")
+            if touched:
+                git(repo, "worktree", "prune")
+        summary = ", ".join(f"{n} {why}" for why, n in sorted(kept.items(), key=lambda kv: -kv[1]))
+        print(f"{'dry-run: would remove' if args.dry_run else 'removed'} {removed}; kept "
+              f"{sum(kept.values())}{' (' + summary + ')' if summary else ''}; {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+[Unit]
+Description=Remove T3 worktrees whose PR merged or whose thread was deleted
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=%h/.local/bin/reap-merged-worktrees

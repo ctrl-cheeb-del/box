@@ -19,7 +19,7 @@ fi
 # The heartbeat needs bash 4; macOS ships 3.2.
 [ -x /opt/homebrew/bin/bash ] || brew install -q bash
 
-for f in reapers/reap-convex-executors reapers/reap-idle-dev-stacks reapers/reap-stale-tmp \
+for f in reapers/reap-convex-executors reapers/reap-idle-dev-stacks reapers/reap-stale-tmp reapers/reap-merged-worktrees \
          heartbeat/box-heartbeat mac/t3-service-wrap; do
   install -m 755 "$REPO/$f" "$BIN/"
 done
@@ -69,6 +69,7 @@ job t3-service-wrap "watch:$AGENTS/com.t3tools.t3code.service.plist" "$BIN/t3-se
 job reap-convex-executors 600 "$BIN/reap-convex-executors"
 job reap-idle-dev-stacks 1800 "$BIN/reap-idle-dev-stacks"
 job reap-stale-tmp 3600 "$BIN/reap-stale-tmp"
+job reap-merged-worktrees 86400 "$BIN/reap-merged-worktrees"
 job heartbeat 1800 "$BIN/box-heartbeat"
 
 [ -s "$HOME/.config/box/ntfy-topic" ] || echo "heartbeat: copy ~/.config/box/ntfy-topic from another box (it's the only secret)"

@@ -289,11 +289,13 @@ A box never reboots, so leaks that a laptop clears by sleeping pile up. On 2026-
 `bun dev` stacks (3-5 GB each) filled skynet's memory and T3 stopped answering. Three guards:
 
 - **Reaper timers.** Run [`reapers/install`](../reapers/install): it copies the scripts to `~/.local/bin/`
-  and the units to `~/.config/systemd/user/`, and enables the three timers. `box update` reruns it, so
+  and the units to `~/.config/systemd/user/`, and enables the four timers. `box update` reruns it, so
   reaper fixes reach every box.
   `reap-idle-dev-stacks` stops a stack with no activity for 8 hours and writes a `[reaper]` line to its
   `dev.log`; try `reap-idle-dev-stacks --dry-run`. `reap-convex-executors` kills Convex local-backend
-  executors orphaned by a stopped backend. `reap-stale-tmp` runs hourly and removes top-level `/tmp`
+  executors orphaned by a stopped backend. `reap-merged-worktrees` runs daily and removes T3
+  worktrees whose PR merged or closed (or whose thread was deleted with everything pushed), once clean and idle
+  for 2 days. `reap-stale-tmp` runs hourly and removes top-level `/tmp`
   entries only when every file and directory has both mtime and atime at least two days old and no
   live process has a cwd or open file in the tree. It skips other users' entries (including descendants),
   sockets, symlinks, special files, mounts and tmux/ssh/systemd/X11/.ICE directories. Directory scans use
