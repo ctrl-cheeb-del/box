@@ -313,6 +313,8 @@ def heavy_bun(args):
         return len(words) > 1 and words[1].split("@", 1)[0] == "tsc"
     if Path(command).name in {"check.ts", "tsc-first-cause.ts", "tsc", "tsc.js"}:
         return not self_queued(args, command, file=True)
+    if self_queued(args, command):
+        return False
     return command.split(":", 1)[0] in {"check", "typecheck", "build", "test", "tsc"}
 
 

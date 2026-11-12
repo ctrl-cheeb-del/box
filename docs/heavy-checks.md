@@ -30,7 +30,8 @@ Dependency writes (`bun install`/`i`, `add`, `remove`, `update`) and direct `che
 
 A project whose check queues its own heavy half lists it in `package.json`
 `heavyCheck.selfQueued`, by script name (`"check"`) and by the file that script runs
-(`"scripts/check.ts"`, from the package root). Listed ones bypass the launcher, so their
+(`"scripts/check.ts"`, from the package root). Listed ones bypass the launcher, as `bun run <name>`
+or the bare `bun <name>`, so their
 light steps and light modes (revnu2's `check --fast`) never wait for a slot.
 
 Dev servers, lint, ordinary scripts, version/help queries, and
