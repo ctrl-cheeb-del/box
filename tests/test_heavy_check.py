@@ -625,6 +625,9 @@ class WiringTests(unittest.TestCase):
                 self.assertFalse(module.heavy_bun(["run", "check", "--only", "nosuch"]))
                 self.assertFalse(module.heavy_bun(["run", "check", "--bogus"]))
                 self.assertTrue(module.heavy_bun(["run", "typecheck"]))
+                # regression: REV-2858 bare `bun test:loaded` queued though the project listed it
+                self.assertFalse(module.heavy_bun(["check", "--fast"]))
+                self.assertTrue(module.heavy_bun(["typecheck"]))
             # `bun run check` runs `bun scripts/check.ts`; its --fast mode must not queue.
             with chdir(root):
                 self.assertFalse(module.heavy_bun(["--no-env-file", "scripts/check.ts", "--fast"]))
