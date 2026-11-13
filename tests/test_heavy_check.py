@@ -91,9 +91,9 @@ class QueueTests(unittest.TestCase):
 
     def test_pause_blocks_admission_until_cleared(self):
         config = json.loads(self.config.read_text())
-        self.config.write_text(json.dumps(config | {"paused": True}))
+        self.config.write_text(json.dumps(config | {"paused": "art: disk swap, back 18:00"}))
         job = self.submit("print('admitted')")
-        self.wait(lambda: "maintenance pause" in self.cli("logs", job).stdout)
+        self.wait(lambda: "maintenance pause (art: disk swap, back 18:00)" in self.cli("logs", job).stdout)
         self.assertEqual(self.jobs()[job]["state"], "queued")
         self.config.write_text(json.dumps(config))
         self.assertEqual(self.finished(job)["code"], 0)
@@ -247,6 +247,8 @@ class QueueTests(unittest.TestCase):
         for expected in ("timeout (exit 124): gave up after waiting 2s", "the command never started",
                          f"Ahead of it:\n  {holder} running", "HEAVY_CHECK_MAX_WAIT=30m", "heavy-check status"):
             self.assertIn(expected, result.stderr)
+        # regression: REV-3360, bun setup keeps only the last line and recorded the hint, not the blocker
+        self.assertIn("gave up after 2s, blocked by: ", result.stderr.strip().splitlines()[-1])
         self.assertEqual(self.jobs()[holder]["state"], "running")
 
     def test_bad_max_wait_fails_before_queueing(self):
@@ -486,7 +488,8 @@ class QueueMetadataTests(unittest.TestCase):
             (root / "io").write_text("full avg10=0.0\n")
             (root / "memory").write_text("full avg10=0.0\n")
             self.assertEqual(self.queue.pressure_blocks(self.queue.DEFAULTS, root), [])
-            self.assertEqual(self.queue.pressure_blocks(self.queue.DEFAULTS | {"paused": True}, root), ["maintenance pause"])
+            [block] = self.queue.pressure_blocks(self.queue.DEFAULTS | {"paused": True}, root)
+            self.assertTrue(block.startswith("maintenance pause") and 'clear "paused"' in block, block)
 
     def test_npx_dispatch(self):
         for args in (["tsc", "--noEmit"], ["--yes", "tsc"], ["--package", "typescript", "tsc"]):

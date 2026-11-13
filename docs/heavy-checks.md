@@ -189,7 +189,10 @@ otherwise it runs only `echo`. It never starts a project build.
 
 Skynet uses one slot and more conservative memory/pressure thresholds after the
 2026-11-06 overload. `paused: true` temporarily pauses Linux admissions during
-maintenance; clear it to resume. Existing running jobs are not stopped.
+maintenance; clear it to resume. Existing running jobs are not stopped. Prefer a note
+over `true`, such as `"paused": "art: disk swap, back 18:00"`: every waiting job prints
+it, with how long ago the config changed, so nobody has to guess who paused or for how
+long. A job that gives up ends its output with what blocked it.
 
 To reserve CPU for Skynet’s desktop and SSH, its managed agent slice also has
 `CPUQuota=800%` (eight of twelve CPUs), set persistently with
