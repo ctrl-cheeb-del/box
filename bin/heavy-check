@@ -36,6 +36,8 @@ def settings():
     for key in ("reserve_gib", "headroom_gib", "idle_gib", "io_full_pct", "memory_full_pct"):
         if not isinstance(config[key], (int, float)) or config[key] < 0:
             raise ValueError(f"{key} must be a nonnegative number")
+    if not isinstance(config.get("paused", False), (bool, str)):
+        raise ValueError('paused must be true, false, or a note such as "art: disk swap, back 18:00"')
     return config
 
 
@@ -104,9 +106,19 @@ def cgroup_available_gib(root=Path("/sys/fs/cgroup"), membership=Path("/proc/sel
         return float("inf")
 
 
+def pause_block(paused):
+    """Say who paused and why when the pause carries a note, and how to resume."""
+    note = f" ({paused})" if isinstance(paused, str) else ""
+    try:
+        since = f", set {duration(time.time() - CONFIG.stat().st_mtime)} ago"
+    except OSError:
+        since = ""
+    return f"maintenance pause{note}{since}; clear \"paused\" in {CONFIG} to resume"
+
+
 def pressure_blocks(config, root=Path("/proc/pressure")):
     """Pause new admissions during sustained stalls, never cancel existing work."""
-    blocks = ["maintenance pause"] if config.get("paused", False) else []
+    blocks = [pause_block(config["paused"])] if config.get("paused", False) else []
     if sys.platform != "linux":
         return blocks
     for resource, key in (("io", "io_full_pct"), ("memory", "memory_full_pct")):
@@ -419,12 +431,14 @@ def queue_notice(db, job, config, available, required, now, limit, pressure=()):
     return snapshot, line, ahead
 
 
-def timeout_message(ahead, line, limit, now):
+def timeout_message(ahead, line, gates, limit, now):
     holders = "\n".join(f"  {describe(other, now)}" for other in ahead) or "  nobody (memory alone kept it out)"
+    # Last line names the blocker: callers such as `bun setup` keep only the last line.
     return (f"gave up after waiting {duration(limit)} in the heavy-check queue; the command never started.\n"
             f"Last state: {line}\nAhead of it:\n{holders}\n"
             "To wait longer: HEAVY_CHECK_MAX_WAIT=30m (or 0 for no limit) before the command. "
-            "To see the queue: heavy-check status.")
+            "To see the queue: heavy-check status.\n"
+            f"heavy-check gave up after {duration(limit)}, blocked by: {', '.join(gates) or 'nothing'}")
 
 
 def wait_for_job(job_id, child):
@@ -559,7 +573,7 @@ def work(job_id):
                     snapshot, line, ahead = queue_notice(db, job, config, available, required, now, limit, pressure)
                     if limit and now - job["created"] >= limit:
                         state, code = "timeout", 124
-                        failure_reason = timeout_message(ahead, line, limit, now)
+                        failure_reason = timeout_message(ahead, line, snapshot[2], limit, now)
                         break
                     if (last_notice is None or snapshot != last_snapshot
                             or time.monotonic() - last_notice >= HEARTBEAT):
