@@ -279,6 +279,18 @@ unsupported`, and `t3 service install` failed the same way. Cause: the update le
 `systemctl --user reset-failed t3code && systemctl --user start t3code`. Codex is the standalone install
 (`~/.codex/packages/standalone`), so update it with `codex update`, not npm.
 
+## Clients can't pair: "Unknown session token" (2026-11-15)
+
+Symptom: in the Mac's Settings → Environments, skynet showed "This device could not prepare the
+connection", and after re-adding it, "T3 Connect returned an error". The routes still answered 200.
+`~/.t3/userdata/logs/boot-service.log` kept logging `Rejected authenticated session credential` /
+`Unknown session token`. Cause: on 0.1.10-nightly.20261114, a database transaction got stuck open, so
+`statev2.sqlite` and `-wal` stopped changing on disk (check with `stat`) while every write still
+reported success. Sign-ins were created but never saved, so the next check rejected them. The server
+held the unsaved writes in memory (10.7G resident). Shutdown confirmed it with
+`cannot commit transaction - SQL statements in progress`. Fix: restart `t3code.service` (anything done
+since the stall is lost), then remove and re-add the environment on each client.
+
 ## Out of memory from forgotten dev stacks (2026-10-02)
 
 Symptom: T3 Code can't connect, `box status` shows memory ~full, load 30+. Not the executor leak: the box had 7
