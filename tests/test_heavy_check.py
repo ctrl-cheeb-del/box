@@ -351,6 +351,26 @@ class QueueTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(marker.exists())
 
+    # regression: REV-4014 cancelling a running sample left its setsid'd children alive
+    def test_cancel_kills_children_that_left_the_process_group(self):
+        self.configure(slots=1)
+        escaped, orphan = self.root / "escaped", self.root / "orphan"
+        touch = "import time; from pathlib import Path; time.sleep(3); Path({!r}).touch()"
+        # The orphan's parent exits at once, so only its environment ties it to the job.
+        daemon = (f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{touch.format(str(orphan))!r}], "
+                  "start_new_session=True)")
+        job = self.submit(f"import subprocess,sys,time; "
+                          f"subprocess.Popen([sys.executable,'-c',{touch.format(str(escaped))!r}], start_new_session=True); "
+                          f"subprocess.run([sys.executable,'-c',{daemon!r}]); time.sleep(30)")
+        self.wait(lambda: self.jobs()[job]["state"] == "running")
+        time.sleep(0.5)
+        self.cli("cancel", job)
+        self.assertEqual(self.finished(job)["state"], "cancelled")
+        time.sleep(3.5)
+        self.assertFalse(escaped.exists())
+        if sys.platform == "linux":
+            self.assertFalse(orphan.exists())
+
     def test_crashed_supervisor_and_invalid_command_release_slots(self):
         self.configure(slots=1)
         job = self.submit("import time; time.sleep(30)")
