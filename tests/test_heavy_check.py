@@ -351,6 +351,26 @@ class QueueTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(marker.exists())
 
+    # regression: REV-4014 cancelling a running sample left its setsid'd children alive
+    def test_cancel_kills_children_that_left_the_process_group(self):
+        self.configure(slots=1)
+        escaped, orphan = self.root / "escaped", self.root / "orphan"
+        touch = "import time; from pathlib import Path; time.sleep(3); Path({!r}).touch()"
+        # The orphan's parent exits at once, so only its environment ties it to the job.
+        daemon = (f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{touch.format(str(orphan))!r}], "
+                  "start_new_session=True)")
+        job = self.submit(f"import subprocess,sys,time; "
+                          f"subprocess.Popen([sys.executable,'-c',{touch.format(str(escaped))!r}], start_new_session=True); "
+                          f"subprocess.run([sys.executable,'-c',{daemon!r}]); time.sleep(30)")
+        self.wait(lambda: self.jobs()[job]["state"] == "running")
+        time.sleep(0.5)
+        self.cli("cancel", job)
+        self.assertEqual(self.finished(job)["state"], "cancelled")
+        time.sleep(3.5)
+        self.assertFalse(escaped.exists())
+        if sys.platform == "linux":
+            self.assertFalse(orphan.exists())
+
     def test_crashed_supervisor_and_invalid_command_release_slots(self):
         self.configure(slots=1)
         job = self.submit("import time; time.sleep(30)")
@@ -599,17 +619,20 @@ class WiringTests(unittest.TestCase):
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        for args in (["run", "check"], ["run", "--silent", "typecheck:scripts"],
-                     ["--cwd", "/project", "run", "build"], ["run", "--filter", "*", "test"],
-                     ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"], ["install"], ["install", "--frozen-lockfile"], ["run", "tsc", "--noEmit"],
-                     ["node_modules/typescript7/bin/tsc", "--noEmit"], ["scripts/tsc-first-cause.ts"]):
-            with self.subTest(args=args):
-                self.assertTrue(module.heavy_bun(args))
-        for args in (["--version"], ["run", "dev"], ["run", "lint"],
-                     ["scripts/small.ts"], ["test", "unit.test.ts"],
-                     ["test", "-t", "one test"], ["run", "check", "--help"]):
-            with self.subTest(args=args):
-                self.assertFalse(module.heavy_bun(args))
+        # regression: REV-4714 run from inside revnu2, its selfQueued list reclassified `run check`
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            Path(directory, "package.json").write_text("{}")
+            for args in (["run", "check"], ["run", "--silent", "typecheck:scripts"],
+                         ["--cwd", "/project", "run", "build"], ["run", "--filter", "*", "test"],
+                         ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"], ["install"], ["install", "--frozen-lockfile"], ["run", "tsc", "--noEmit"],
+                         ["node_modules/typescript7/bin/tsc", "--noEmit"], ["scripts/tsc-first-cause.ts"]):
+                with self.subTest(args=args):
+                    self.assertTrue(module.heavy_bun(args))
+            for args in (["--version"], ["run", "dev"], ["run", "lint"],
+                         ["scripts/small.ts"], ["test", "unit.test.ts"],
+                         ["test", "-t", "one test"], ["run", "check", "--help"]):
+                with self.subTest(args=args):
+                    self.assertFalse(module.heavy_bun(args))
 
     def test_self_queued_scripts_bypass_the_launcher(self):
         loader = importlib.machinery.SourceFileLoader("queue_self", str(QUEUE))

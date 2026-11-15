@@ -477,16 +477,59 @@ def group_exists(pgid):
     return signal_group(pgid, 0)
 
 
-def terminate(child):
-    if not signal_group(child.pid, signal.SIGTERM):
-        return
+def escaped(job_id, root=None):
+    """Processes the command started outside its process group (setsid, start_new_session),
+    which killpg misses: descendants of a still-running root, and on Linux any process
+    carrying the job's HEAVY_CHECK_JOB, which still finds them after their parent exits."""
+    rows = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True, capture_output=True, timeout=5).stdout
+    children = {}
+    for line in rows.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    found, stack = set(), [root] if root else []
+    while stack:
+        for pid in children.get(stack.pop(), []):
+            if pid not in found:
+                found.add(pid)
+                stack.append(pid)
+    if sys.platform == "linux":
+        marker = f"HEAVY_CHECK_JOB={job_id}".encode()
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                try:
+                    if marker in (entry / "environ").read_bytes().split(b"\0"):
+                        found.add(int(entry.name))
+                except OSError:
+                    pass
+    found -= {root, os.getpid()}
+    return {pid: ident for pid, ident in identities(found).items() if ident}
+
+
+def signal_escaped(processes, signum):
+    """Signal the ones still alive (same identity, so never a recycled PID); report if any were."""
+    alive = identities(processes)
+    living = [pid for pid, ident in processes.items() if alive.get(pid) == ident]
+    for pid in living:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signum)
+    return bool(living)
+
+
+def terminate(child, job_id):
+    # Found before the group dies: once their parent exits they reparent away from the tree.
+    # A reaped child's PID may already be someone else's, so only walk a live one.
+    strays = escaped(job_id, child.pid if child.poll() is None else None)
+    in_group = signal_group(child.pid, signal.SIGTERM)
+    signal_escaped(strays, signal.SIGTERM)
     deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
+    while (in_group or strays) and time.monotonic() < deadline:
         child.poll()
-        if not group_exists(child.pid):
+        if not group_exists(child.pid) and not signal_escaped(strays, 0):
             break
         time.sleep(0.05)
     signal_group(child.pid, signal.SIGKILL)
+    signal_escaped(strays, signal.SIGKILL)
     child.wait()
 
 
@@ -577,13 +620,13 @@ def work(job_id):
                                        event[1], event[0])
                     cancelled = db.execute("SELECT cancel FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
                 if cancelled:
-                    terminate(child)
+                    terminate(child, job_id)
                     state, code = "cancelled", 130
                     break
                 result = child.poll()
                 if result is not None:
                     # Commands must not leave background children occupying memory.
-                    terminate(child)
+                    terminate(child, job_id)
                     code = result if result >= 0 else 128 - result
                     state = "done" if code == 0 else "failed"
                     if result < 0:
@@ -594,7 +637,7 @@ def work(job_id):
         failure_reason = f"worker error: {error}"
     finally:
         if child is not None and child.poll() is None:
-            terminate(child)
+            terminate(child, job_id)
         with database() as db:
             job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if job["cancel"]:
