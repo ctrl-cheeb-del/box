@@ -599,17 +599,20 @@ class WiringTests(unittest.TestCase):
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
         loader.exec_module(module)
-        for args in (["run", "check"], ["run", "--silent", "typecheck:scripts"],
-                     ["--cwd", "/project", "run", "build"], ["run", "--filter", "*", "test"],
-                     ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"], ["install"], ["install", "--frozen-lockfile"], ["run", "tsc", "--noEmit"],
-                     ["node_modules/typescript7/bin/tsc", "--noEmit"], ["scripts/tsc-first-cause.ts"]):
-            with self.subTest(args=args):
-                self.assertTrue(module.heavy_bun(args))
-        for args in (["--version"], ["run", "dev"], ["run", "lint"],
-                     ["scripts/small.ts"], ["test", "unit.test.ts"],
-                     ["test", "-t", "one test"], ["run", "check", "--help"]):
-            with self.subTest(args=args):
-                self.assertFalse(module.heavy_bun(args))
+        # regression: REV-4714 run from inside revnu2, its selfQueued list reclassified `run check`
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            Path(directory, "package.json").write_text("{}")
+            for args in (["run", "check"], ["run", "--silent", "typecheck:scripts"],
+                         ["--cwd", "/project", "run", "build"], ["run", "--filter", "*", "test"],
+                         ["test"], ["test", "--timeout", "5000"], ["x", "tsc", "-b"], ["check"], ["build"], ["install"], ["install", "--frozen-lockfile"], ["run", "tsc", "--noEmit"],
+                         ["node_modules/typescript7/bin/tsc", "--noEmit"], ["scripts/tsc-first-cause.ts"]):
+                with self.subTest(args=args):
+                    self.assertTrue(module.heavy_bun(args))
+            for args in (["--version"], ["run", "dev"], ["run", "lint"],
+                         ["scripts/small.ts"], ["test", "unit.test.ts"],
+                         ["test", "-t", "one test"], ["run", "check", "--help"]):
+                with self.subTest(args=args):
+                    self.assertFalse(module.heavy_bun(args))
 
     def test_self_queued_scripts_bypass_the_launcher(self):
         loader = importlib.machinery.SourceFileLoader("queue_self", str(QUEUE))
