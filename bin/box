@@ -455,9 +455,15 @@ PY
   return $failed
 }
 
+# Art's MacBook: only this repo and the heavy-check it installed; Art updates his own apps.
+MAC_UPDATE='git -C ~/Documents/projects/box pull -q --ff-only || { echo "box: could not fast-forward ~/Documents/projects/box; fix it, then rerun box update" >&2; exit 1; }
+if [ -f "$HOME/.local/share/box/heavy-check-install.json" ]; then python3 ~/Documents/projects/box/bin/install-heavy-checks; fi'
+
 cmd_update() {
+  local h
+  if has_role $TARGET mac; then h=$(resolve) || return 1; ont "$h" "$MAC_UPDATE"; return; fi
   need_box update || return 1
-  local h; h=$(resolve) || return 1
+  h=$(resolve) || return 1
   # macOS box: no apt; Codex is an npm global there, and `t3 update` restarts its own launchd service
   # (com.box.t3-service-wrap then puts box-launch back in front of it). install-macbox refreshes the
   # heartbeat and reapers.
@@ -493,7 +499,8 @@ Commands ([machine] defaults to $(machine_with_role default); "all" means every 
   box list                      every machine and whether it's reachable right now
   box status [machine|all]      health check: services, Claude, browser sandbox, battery, disk
   box logs [machine] [unit]     follow logs: t3code (default), cliproxyapi, gnome-remote-desktop, reapers/heartbeat
-  box update [machine|all]      update Ubuntu (not macOS), T3 Code, Claude Code, Codex, bun, and this CLI
+  box update [machine|all]      update Ubuntu (not macOS), T3 Code, Claude Code, Codex, bun, and this CLI;
+                                on the Mac, only this CLI and heavy-check
   box reboot [machine]          reboot and wait until it's back (kills its running agent threads)
   box threads search <query>    search T3 titles, messages and Claude transcripts on every machine
   box sync-memory               two-way sync of revnu2 Claude memories with every machine

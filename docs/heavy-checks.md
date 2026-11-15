@@ -46,7 +46,8 @@ not needed when the machine launcher is installed. Nested wrappers reuse a slot.
 
 `box update` pulls this repo and reruns its installer (after upgrading Bun) when
 `~/.local/share/box/heavy-check-install.json` exists, so the pulled `heavy-check` is
-what gets installed. Swapping it is safe with jobs queued or running: both files are
+what gets installed. Run `box update all` after merging a heavy-check change: that
+includes the Mac, which gets only the repo pull and the reinstall. Swapping it is safe with jobs queued or running: both files are
 replaced atomically, running processes keep the code they started with, and old and
 new workers share the queue database and slot locks. To undo the machine launcher:
 

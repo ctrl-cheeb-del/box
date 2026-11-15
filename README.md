@@ -10,7 +10,7 @@ box desktop [machine]         Ubuntu desktop over FreeRDP (Screen Sharing on a m
 box status [machine|all]      services, Claude, browser sandbox, battery, disk
 box run [machine] <cmd>       one command
 box logs [machine] [unit]     follow a user unit's journal (default t3code; T3's log file on macOS)
-box update [machine|all]      apt (Ubuntu) + t3/claude/codex/bun updates
+box update [machine|all]      apt (Ubuntu) + t3/claude/codex/bun updates; the Mac gets this repo and heavy-check only
 box reboot [machine]          reboot, wait, show status
 box threads search <query>    search T3 threads on every reachable machine
 box sync-memory               two-way sync of revnu2 Claude memories with every machine
